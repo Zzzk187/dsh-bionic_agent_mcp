@@ -77,6 +77,10 @@ def init_db():
         _add_column_if_missing(conn, "memories", "expires_at", "TEXT")
         _add_column_if_missing(conn, "memories", "supersedes_id", "INTEGER")
         _add_column_if_missing(conn, "memories", "conflict_group", "TEXT")
+        # Retry bookkeeping for task resume. Without it, a task that fails and
+        # is retried is indistinguishable from one that never failed, and
+        # nothing can stop an automatic retry loop from spinning forever.
+        _add_column_if_missing(conn, "tasks", "retry_count", "INTEGER NOT NULL DEFAULT 0")
         conn.execute("CREATE TABLE IF NOT EXISTS memory_links ("
                      "id INTEGER PRIMARY KEY AUTOINCREMENT,"
                      "source_memory_id INTEGER NOT NULL,"

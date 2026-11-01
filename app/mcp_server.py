@@ -18,6 +18,8 @@ from app import governance_service as gov
 from app import governance_maintenance as maint
 from app import memory_lifecycle as life
 from app import feedback_loop
+from app import task_resume
+from app import expiry
 from app import snapshots
 from app import protection
 from app import distillation
@@ -79,26 +81,113 @@ def _memory_out(row, include_governance: bool = False):
 
 @mcp.tool()
 def save_memory(content: str, category: str = "general", source: str = "deepseek-harness",
-                confidence: float = 0.8, tags: list[str] | None = None) -> dict:
-    """保存一条持久记忆；自动去重检索并写审计，返回新记忆 id。"""
+                confidence: float = 0.8, tags: list[str] | None = None,
+                ttl_days: float = 0) -> dict:
+    """保存一条持久记忆；写审计，返回新记忆 id。
+
+    `ttl_days` 只对临时类记忆生效（temp/cache/session/todo 等）。对
+    preference/fact 这类长期有效的记忆传入会被**明确拒绝并说明原因**，
+    而不是静默忽略——否则调用方会以为自己设了有效期，实际上永远不过期。
+    """
     _ensure_db()
     content = content.strip()
     if not content:
         return {"ok": False, "message": "content must not be empty"}
     confidence = max(0.0, min(float(confidence), 1.0))
     safe_tags = list(dict.fromkeys(str(t).strip()[:50] for t in (tags or []) if str(t).strip()))[:20]
+
+    expires_at = None
+    ttl_warning = ""
+    if ttl_days:
+        refusal = expiry.explain_ttl_refusal(category)
+        if refusal:
+            ttl_warning = refusal
+        else:
+            expires_at = expiry.ttl_to_expires_at(ttl_days)
+            if expires_at is None:
+                ttl_warning = f"ttl_days={ttl_days!r} 无法转换为有效期（必须 > 0），已忽略"
+
+    # Classify on write. Leaving memory_type NULL "for later" would make the
+    # recall profiles dead code on every row; and a wrong guess here only
+    # re-orders results, never hides them.
+    type_guess = life.classify_memory_type(content, category, source)
+    guessed_type = type_guess.get("memory_type") or "unknown"
+    stored_type = None if guessed_type == "unknown" else guessed_type
+
     with connect() as conn:
         cur = conn.execute(
-            """INSERT INTO memories(content,category,source,confidence,tags_json)
-               VALUES(?,?,?,?,?)""",
+            """INSERT INTO memories(content,category,source,confidence,tags_json,expires_at,memory_type)
+               VALUES(?,?,?,?,?,?,?)""",
             (content[:10000], category[:100], source[:200], confidence,
-             json.dumps(safe_tags, ensure_ascii=False))
+             json.dumps(safe_tags, ensure_ascii=False), expires_at, stored_type)
         )
         memory_id = cur.lastrowid
+        detail = f"memory_id={memory_id}; category={category[:100]}; source={source[:200]}"
+        if stored_type:
+            detail += f"; memory_type={stored_type}"
+        if expires_at:
+            detail += f"; expires_at={expires_at}"
         conn.execute("INSERT INTO events(event_type,detail) VALUES(?,?)",
-                     ("memory.created", f"memory_id={memory_id}; category={category[:100]}; source={source[:200]}"))
+                     ("memory.created", detail))
+        if ttl_warning:
+            conn.execute("INSERT INTO events(event_type,detail) VALUES(?,?)",
+                         ("memory.ttl_refused", f"memory_id={memory_id}; {ttl_warning}"))
         row = conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
-    return _memory_out(row)
+    out = _memory_out(row)
+    out["memory_type"] = stored_type
+    out["type_confidence"] = type_guess.get("confidence")
+    if type_guess.get("needs_review"):
+        out["type_needs_review"] = True
+        out["type_reasons"] = type_guess.get("reasons")
+    if expires_at:
+        out["expires_at"] = expires_at
+        out["ttl_days"] = float(ttl_days)
+    if ttl_warning:
+        out["ttl_warning"] = ttl_warning
+        out["ttl_applied"] = False
+    elif ttl_days:
+        out["ttl_applied"] = True
+    return out
+
+@mcp.tool()
+def set_memory_expiry(memory_id: int, days: float = 0, expires_at: str = "") -> dict:
+    """给已有记忆设/清有效期。days>0 按天数算；显式 expires_at 优先。days<=0 且无 expires_at 表示清除。"""
+    _ensure_db()
+    if expires_at.strip():
+        ts = expiry._parse_ts(expires_at.strip())
+        if ts is None:
+            return {"ok": False, "message": f"expires_at 无法解析：{expires_at!r}"}
+        value = ts.isoformat()
+    elif days and float(days) > 0:
+        value = expiry.ttl_to_expires_at(days)
+    else:
+        value = None
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM memories WHERE id=?", (int(memory_id),)).fetchone()
+        if not row:
+            return {"ok": False, "message": "Memory not found", "memory_id": int(memory_id)}
+        memory = rowdict(row)
+        if value is not None:
+            refusal = expiry.explain_ttl_refusal(memory.get("category") or "")
+            if refusal:
+                return {"ok": False, "message": refusal, "memory_id": int(memory_id)}
+        conn.execute("UPDATE memories SET expires_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                     (value, int(memory_id)))
+        conn.execute("INSERT INTO events(event_type,detail) VALUES(?,?)",
+                     ("memory.expiry_set", f"memory_id={memory_id}; expires_at={value}"))
+    return {"ok": True, "memory_id": int(memory_id), "expires_at": value}
+
+@mcp.tool()
+def scan_expired_memories(limit: int = 200, include_protected: bool = False) -> dict:
+    """列出真正过期的记忆（只读）。过保护档的记忆会进 skipped 并说明原因。"""
+    _ensure_db()
+    return expiry.scan_expired(limit=limit, include_protected=include_protected)
+
+@mcp.tool()
+def run_expiry_policy(dry_run: bool = True, limit: int = 200, archive: bool = False) -> dict:
+    """执行过期策略：标记 + 降权，可选送人工审核。默认 dry_run，不会自动归档。"""
+    _ensure_db()
+    return expiry.run_expiry(dry_run=dry_run, limit=limit, archive=archive)
 
 @mcp.tool()
 def search_memories(query: str = "", limit: int = 20, category: str = "", include_archived: bool = False) -> list[dict]:
@@ -408,16 +497,33 @@ def handoff_task(task_id: int, summary: str, state_json: str = "{}") -> dict:
 
 @mcp.tool()
 def resume_task(task_id: int) -> dict:
-    """把暂停/交接后的任务重新标为活跃。"""
+    """续跑任务：把状态改回 active，并返回可用的执行上下文。
+
+    以前这里只是 `UPDATE status='active'`，快照从来没被读过——调用方按文档
+    续跑，拿到的是一个状态写着 active、上下文全丢的空壳。现在返回值里带
+    最近一次阶段快照的 state、摘要和下一步，并且在没有快照时明确写
+    context_available=false，而不是假装恢复成功。
+    """
     _ensure_db()
-    with connect() as conn:
-        task = conn.execute("SELECT * FROM tasks WHERE id=?", (int(task_id),)).fetchone()
-        if not task:
-            return {"ok": False, "message": "Task not found", "task_id": int(task_id)}
-        conn.execute("UPDATE tasks SET status='active',updated_at=CURRENT_TIMESTAMP WHERE id=?", (int(task_id),))
-        conn.execute("INSERT INTO events(task_id,event_type,detail) VALUES(?,?,?)",
-                     (int(task_id), "task.resumed", f"stage={task['current_stage']}"))
-    return {"ok": True, "task_id": int(task_id), "status": "active", "stage": int(task["current_stage"])}
+    return task_resume.resume(int(task_id))
+
+@mcp.tool()
+def get_resume_packet(task_id: int) -> dict:
+    """查看任务的续跑上下文（只读，不改状态）。重启后想知道从哪继续就用它。"""
+    _ensure_db()
+    return task_resume.build_resume_packet(int(task_id))
+
+@mcp.tool()
+def find_stuck_tasks(stuck_hours: float = 24.0, limit: int = 50) -> dict:
+    """找出「声称在跑但很久没动」和「已标记失败」的任务。只读，不自动重试。"""
+    _ensure_db()
+    return task_resume.find_stuck_tasks(stuck_hours=stuck_hours, limit=limit)
+
+@mcp.tool()
+def fail_task(task_id: int, reason: str = "") -> dict:
+    """把任务标记为失败（保留快照与事件，之后仍可带上下文重试）。"""
+    _ensure_db()
+    return task_resume.mark_failed(int(task_id), reason)
 
 @mcp.tool()
 def complete_task(task_id: int, result: str = "") -> dict:
@@ -1042,6 +1148,56 @@ def record_recall(memory_ids: list[int] | None = None) -> dict:
     """手动记录一批记忆被召回（曝光）。只留痕，不改变任何评分。"""
     _ensure_db()
     return feedback_loop.record_retrieved(memory_ids or [])
+
+
+@mcp.tool()
+def backfill_memory_types(dry_run: bool = True, limit: int = 500) -> dict:
+    """给还没有 memory_type 的记忆补上类型（默认 dry_run 只报告）。
+
+    单独做一个工具是因为：老数据在写入时没有类型，而召回画像依赖类型。
+    补类型是纯增量操作（只写 memory_type 一列，不动内容/状态），但它会
+    改变排序行为，所以默认 dry_run——先看清楚改了哪些，再决定要不要落库。
+    """
+    _ensure_db()
+    limit = max(1, min(int(limit), 2000))
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, content, category, source FROM memories "
+            "WHERE memory_type IS NULL AND status='active' ORDER BY id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        planned = []
+        for r in rows:
+            guess = life.classify_memory_type(r["content"] or "",
+                                              r["category"] or "", r["source"] or "")
+            mtype = guess.get("memory_type") or "unknown"
+            if mtype == "unknown":
+                continue
+            planned.append({"memory_id": r["id"], "memory_type": mtype,
+                            "confidence": guess.get("confidence"),
+                            "needs_review": bool(guess.get("needs_review"))})
+        if not dry_run:
+            for p in planned:
+                conn.execute("UPDATE memories SET memory_type=? WHERE id=?",
+                             (p["memory_type"], p["memory_id"]))
+            if planned:
+                conn.execute(
+                    "INSERT INTO events(event_type,detail) VALUES(?,?)",
+                    ("memory.types_backfilled",
+                     f"count={len(planned)}; sample_ids={[p['memory_id'] for p in planned[:10]]}"),
+                )
+    return {
+        "ok": True,
+        "dry_run": bool(dry_run),
+        "rule_version": life.LIFECYCLE_RULE_VERSION,
+        "candidates_scanned": len(rows),
+        "would_set": len(planned),
+        "applied": 0 if dry_run else len(planned),
+        "need_review": sum(1 for p in planned if p["needs_review"]),
+        "items": planned,
+        "note": ("干跑：只报告不落库" if dry_run
+                 else "已写回；召回排序会随之变化，但没有任何记忆被删除或隐藏"),
+    }
 
 
 @mcp_gov.tool()

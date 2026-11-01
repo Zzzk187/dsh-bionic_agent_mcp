@@ -24,6 +24,8 @@ from typing import Optional
 from app import db
 from app.embeddings import EmbeddingUnavailable
 from app import feedback_loop
+from app import expiry
+from app import recall_profile
 from app import protection
 from app import governance_service as gov
 from app import governance_rules as rules
@@ -152,11 +154,28 @@ def lifecycle_transitions(row) -> list[str]:
 # Memory-type classification (deterministic; never elevates inference to fact)
 # --------------------------------------------------------------------------
 _TYPE_HINTS = [
-    ("preference", re.compile(r"\b(prefer|preference|like|dislike|want|need|wish|would rather|习惯|偏好|喜欢|讨厌|不想)\b", re.I)),
-    ("procedural", re.compile(r"\b(how to|step|procedure|workflow|run|execute|command|script|recipe|流程|步骤|如何|怎么|命令)\b", re.I)),
-    ("goal", re.compile(r"\b(goal|objective|plan|target|aim|milestone|目标|计划|任务|打算)\b", re.I)),
-    ("reflection", re.compile(r"\b(lesson|learned|reflection|retrospective|insight|mistake|复盘|教训|反思|学到的)\b", re.I)),
-    ("episodic", re.compile(r"\b(yesterday|last time|happened|meeting|on monday|we discussed|昨天|上次|发生|会议|我们讨论)\b", re.I)),
+    # English terms keep \b (so "plan" does not match "planet"); CJK terms are
+    # bare, because \b never fires between two Han characters and wrapping
+    # them in \b silently disabled every Chinese keyword.
+    ("preference", re.compile(
+        r"(?:\b(?:prefer|preference|like|dislike|want|need|wish|would rather|"
+        r"favorite|favourite|avoid)\b|"
+        r"偏好|喜欢|讨厌|不喜欢|不想|习惯|口味|风格|要求|希望|倾向)", re.I)),
+    ("procedural", re.compile(
+        r"(?:\b(?:how to|step|steps|procedure|workflow|run|execute|command|"
+        r"script|recipe|config|configure|setup|install)\b|"
+        r"流程|步骤|如何|怎么|怎样|命令|脚本|配置|执行|安装|部署|操作)", re.I)),
+    ("goal", re.compile(
+        r"(?:\b(?:goal|objective|plan|target|aim|milestone|roadmap|todo)\b|"
+        r"目标|计划|任务|打算|里程碑|待办|规划)", re.I)),
+    ("reflection", re.compile(
+        r"(?:\b(?:lesson|learned|reflection|retrospective|insight|mistake|"
+        r"takeaway|conclusion)\b|"
+        r"教训|反思|复盘|学到|结论|总结|经验|踩坑|坑)", re.I)),
+    ("episodic", re.compile(
+        r"(?:\b(?:yesterday|last time|happened|meeting|on monday|we discussed|"
+        r"earlier|today)\b|"
+        r"昨天|前天|上次|刚才|那次|当时|会议|讨论|发生|今天)", re.I)),
 ]
 
 
@@ -311,6 +330,13 @@ def recall_memories(query: str = "", top_k: int = 5, category: str = "",
     """
     top_k = max(1, min(int(top_k), 50))
 
+    # Chosen once per query, not per candidate: the weights are a property of
+    # the question being asked. The result carries the profile name so a
+    # surprising ranking can be traced to "which profile" instead of guesswork.
+    profile = recall_profile.weights_for(memory_type=memory_type, query=query)
+    weights = profile["weights"]
+    shape = profile["shape"]
+
     def _run(c):
         sql = ("SELECT * FROM memories WHERE status='active' "
                "AND memory_status NOT IN ('pending_review', 'superseded')")
@@ -363,13 +389,30 @@ def recall_memories(query: str = "", top_k: int = 5, category: str = "",
                 "activation": act,
                 "feedback": fb_term,
             }
-            total = sum(parts[k] * RECALL_WEIGHTS[k] for k in RECALL_WEIGHTS)
+            total = sum(parts[k] * weights[k] for k in weights)
             total += parts["feedback"] * RECALL_FEEDBACK_WEIGHT
+            # Per-candidate soft prior: a "how do I" question gives a memory
+            # typed `procedural` a nudge; it never excludes anything.
+            mtype_mult = recall_profile.type_multiplier(d.get("memory_type") or "", shape)
+            if mtype_mult != 1.0:
+                total *= mtype_mult
+            # Expiry demotes, never removes. A memory past its stated shelf life
+            # is usually still *true*, just no longer current -- so it keeps its
+            # content and just ranks lower, and the caller is told why.
+            exp_penalty = expiry.recall_penalty(d.get("expires_at"))
+            if exp_penalty:
+                total -= exp_penalty
             rec = _clean(d)
             rec["_score"] = round(total, 6)
+            if exp_penalty:
+                rec["_expired"] = True
+                rec["_expiry_penalty"] = exp_penalty
             if explain:
                 rec["_explain"] = {k: round(v, 4) for k, v in parts.items()}
-                rec["_weights"] = dict(RECALL_WEIGHTS, feedback=RECALL_FEEDBACK_WEIGHT)
+                rec["_weights"] = dict(weights, feedback=RECALL_FEEDBACK_WEIGHT)
+                rec["_profile"] = profile["profile"]
+                rec["_profile_reasons"] = profile["reasons"]
+                rec["_type_multiplier"] = mtype_mult
                 rec["_semantic_available"] = sm is not None
                 rec["_activation"] = {
                     "amount": round(act, 4),
