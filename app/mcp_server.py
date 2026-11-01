@@ -20,6 +20,7 @@ from app import memory_lifecycle as life
 from app import feedback_loop
 from app import snapshots
 from app import protection
+from app import distillation
 from app import activation_spreading as spreading
 
 # Two FastMCP instances share the same process/module state but are launched as
@@ -796,6 +797,43 @@ def summarize_protection(category: str = "", include_archived: bool = False) -> 
     with connect() as conn:
         rows = [rowdict(r) for r in conn.execute(sql, args).fetchall()]
     return protection.summarize(rows)
+
+
+@mcp_gov.tool()
+def find_distillation_candidates(limit: int = 20, category: str = "",
+                                 similarity: float = 0.52,
+                                 include_covered: bool = False) -> dict:
+    """找值得提炼的「多次具体经历」（只读，不生成结论文字）。
+
+    规则能可靠地找出同一主题下的多条经历并给出证据，但写不出抽象结论——
+    硬编只会复制原句。所以这里产出候选 + 证据 + 应用方式，结论由调用方写。
+    """
+    _ensure_db()
+    return distillation.find_distillation_candidates(
+        limit=limit, category=category, similarity=similarity,
+        include_covered=include_covered)
+
+
+@mcp_gov.tool()
+def apply_distillation(content: str, source_memory_ids: list[int],
+                       category: str = "reflection", confidence: float = 0.7,
+                       note: str = "", approver: str = "user") -> dict:
+    """把一条抽象结论记成记忆，并用 derived_from 挂回它的证据。
+
+    至少要有 3 条来源记忆：更少就不是「提炼」而是「断言新事实」，
+    那种情况用 save_memory。源记忆不会被改写或删除。
+    """
+    _ensure_db()
+    return distillation.apply_distillation(
+        content=content, source_memory_ids=source_memory_ids, category=category,
+        confidence=confidence, note=note, approver=approver)
+
+
+@mcp_gov.tool()
+def list_distillations(limit: int = 50) -> dict:
+    """列出所有提炼结果、它们的证据，以及是否已被后续记忆反驳。"""
+    _ensure_db()
+    return distillation.list_distillations(limit=limit)
 
 
 @mcp_gov.tool()
