@@ -10,6 +10,7 @@ import json
 from datetime import datetime, timezone
 
 from app import db
+from app import feedback_loop as feedback
 from app.governance_rules import load_rules, RULE_VERSION, GOV_STATUS_ACTIVE, GOV_STATUS_ARCHIVED, \
     GOV_STATUS_SUPERSEDED, GOV_STATUS_PENDING_REVIEW
 from app.governance_scoring import score_memory, score_freshness, archive_candidate, clamp
@@ -119,12 +120,25 @@ def build_scoring_context(conn, memory_id: int) -> dict:
         ).fetchone()[0]
     except Exception:
         update_count = 0
+    # Feedback closes the loop: counters used to be written and never read, so
+    # "helpful" or "corrected" had no effect on how a memory scored. `retrieved`
+    # is intentionally inert in compute_signal -- exposure is not usefulness,
+    # and scoring on it would entrench whatever is already ranked on top.
+    try:
+        fb = feedback.feedback_for(conn, memory_id)
+    except Exception:
+        # Feedback must never be able to break scoring.
+        fb = {"signal": 0.0, "applied": False, "reason": "反馈信号不可用", "samples": 0}
+
     return {
         "link_count": link_count,
         "is_superseded": "supersedes" in relations_in,
         "supersedes_older": "supersedes" in relations_out,
         "update_count": update_count,
         "tags": _safe_tags(conn, memory_id),
+        "feedback_signal": fb.get("signal", 0.0),
+        "feedback_applied": fb.get("applied", False),
+        "feedback_reason": fb.get("reason", ""),
     }
 
 

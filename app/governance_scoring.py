@@ -15,6 +15,10 @@ import re
 from datetime import datetime, timezone
 
 from app.governance_rules import load_rules
+# feedback_loop is imported for its pure arithmetic only (apply_to_confidence).
+# The module does not touch the database at import time, so this file stays
+# DB-free and `score_memories(dry_run=True)` still has no side effects.
+from app import feedback_loop as feedback
 
 GOV_ACTIVE_DEFAULT = "active"
 GOV_STATUS_PENDING_REVIEW = "pending_review"
@@ -202,6 +206,25 @@ def score_credibility(memory: dict, context: dict, rules: dict) -> tuple[float, 
             f"总分 {base + shift:.1f} 超出量程，已软压缩至 {value:.2f}"
             f"（保留来源之间的相对排序）"
         )
+
+    # Feedback moves credibility, because credibility is exactly the question
+    # feedback answers: "was this memory actually right?" The shift is capped
+    # and multiplicative so no amount of feedback can rescue a memory to 100 or
+    # bury one at 0 -- feedback adjusts, it does not overrule the source.
+    # `retrieved` contributes nothing (see app/feedback_loop.py).
+    fb_signal = context.get("feedback_signal")
+    if context.get("feedback_applied") and fb_signal:
+        moved = feedback.apply_to_confidence(value, float(fb_signal))
+        delta = moved - value
+        if abs(delta) >= 0.01:
+            reasons.append(
+                f"反馈信号 {float(fb_signal):+.2f} 调整可信度 {delta:+.2f} "
+                f"（{context.get('feedback_reason', '')}）"
+            )
+            value = moved
+    elif context.get("feedback_reason"):
+        reasons.append(str(context["feedback_reason"]))
+
     return round(value, 2), reasons
 
 

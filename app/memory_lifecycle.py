@@ -23,6 +23,7 @@ from typing import Optional
 
 from app import db
 from app.embeddings import EmbeddingUnavailable
+from app import feedback_loop
 from app import governance_service as gov
 from app import governance_rules as rules
 from app import governance_scoring as scoring
@@ -66,6 +67,13 @@ RECALL_WEIGHTS = {
     "frequency": 0.07,
     "activation": 0.05,
 }
+
+# Feedback nudge for the fused score. Deliberately tiny and its own component
+# rather than folded into "confidence" (which already absorbs feedback through
+# governance scoring): folding it in would double-count the same signal, and
+# keeping it separate keeps `_explain` honest about where a ranking came from.
+# `retrieved` never reaches here -- see app/feedback_loop.py.
+RECALL_FEEDBACK_WEIGHT = 0.06
 
 # Memory-type taxonomy. `unknown` means the row has no type yet (legacy data).
 MEMORY_TYPES = ("episodic", "semantic", "preference", "procedural", "goal", "reflection", "unknown")
@@ -320,6 +328,14 @@ def recall_memories(query: str = "", top_k: int = 5, category: str = "",
                  if (sem.get(d["id"]) is not None and sem.get(d["id"]) >= 0.45)
                  or _keyword_score(query, dict(d).get("content", "")) >= 0.3]
         spread = spreading.activation_for_seed_query(c, seeds) if seeds else {}
+        # One query for every feedback row instead of one per candidate: the
+        # feedback table is small and N+1 lookups here would be the hot path.
+        fb_rows = {}
+        try:
+            for fb in c.execute("SELECT * FROM memory_feedback").fetchall():
+                fb_rows[fb["memory_id"]] = feedback_loop._counts(fb)
+        except Exception:
+            fb_rows = {}
         scored = []
         for row in rows:
             d = dict(row)
@@ -330,6 +346,12 @@ def recall_memories(query: str = "", top_k: int = 5, category: str = "",
             fr = float(d.get("freshness_score") or 0.0)
             freq = _soft_freq(d.get("access_count"))
             act = spread.get(d["id"], {}).get("activation", 0.0)
+            if d["id"] in fb_rows:
+                fb_info = feedback_loop.compute_signal(fb_rows[d["id"]])
+                fb_term = feedback_loop.recall_bonus(fb_info["signal"]) if fb_info["applied"] else 0.0
+            else:
+                fb_info = None
+                fb_term = 0.0
             parts = {
                 "semantic": (sm if sm is not None else 0.0),
                 "keyword": kw,
@@ -338,18 +360,27 @@ def recall_memories(query: str = "", top_k: int = 5, category: str = "",
                 "freshness": fr / 100.0,
                 "frequency": freq / 100.0,
                 "activation": act,
+                "feedback": fb_term,
             }
-            total = sum(parts[k] * w for k, w in RECALL_WEIGHTS.items())
+            total = sum(parts[k] * RECALL_WEIGHTS[k] for k in RECALL_WEIGHTS)
+            total += parts["feedback"] * RECALL_FEEDBACK_WEIGHT
             rec = _clean(d)
             rec["_score"] = round(total, 6)
             if explain:
                 rec["_explain"] = {k: round(v, 4) for k, v in parts.items()}
-                rec["_weights"] = RECALL_WEIGHTS
+                rec["_weights"] = dict(RECALL_WEIGHTS, feedback=RECALL_FEEDBACK_WEIGHT)
                 rec["_semantic_available"] = sm is not None
                 rec["_activation"] = {
                     "amount": round(act, 4),
                     "contributions": spread.get(d["id"], {}).get("contributions", []),
                 }
+                if fb_info is not None:
+                    rec["_feedback"] = {
+                        "signal": fb_info["signal"],
+                        "applied": fb_info["applied"],
+                        "counts": fb_rows[d["id"]],
+                        "reason": fb_info["reason"],
+                    }
             scored.append(rec)
         # Stable sort: highest score first, then recency, then id.
         scored.sort(key=lambda x: (x["_score"], x.get("updated_at") or "", x["id"]),

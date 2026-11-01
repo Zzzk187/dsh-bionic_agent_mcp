@@ -17,6 +17,7 @@ from app.governance_rules import load_rules, RULE_VERSION
 from app import governance_service as gov
 from app import governance_maintenance as maint
 from app import memory_lifecycle as life
+from app import feedback_loop
 from app import activation_spreading as spreading
 
 # Two FastMCP instances share the same process/module state but are launched as
@@ -875,14 +876,49 @@ def get_related_memories(memory_id: int, max_depth: int = 2, relation: str = "",
 @mcp_gov.tool()
 def record_memory_feedback(memory_id: int, feedback_type: str, note: str = "",
                           approver: str = "user") -> dict:
-    """记录一条使用反馈信号（retrieved/used/helpful/not_relevant/corrected）。"""
+    """记录一条使用反馈信号（retrieved/used/helpful/not_relevant/corrected）。
+
+    反馈会回流到评分：helpful/used 抬可信度，corrected/not_relevant 压降，
+    幅度封顶 ±25%。retrieved 只记录曝光、**不参与计分**——曝光不等于有用，
+    否则被召回最多的会自我强化成最高分。至少要有 2 条带方向的反馈才生效。
+    """
     _ensure_db()
     if not isinstance(memory_id, int):
         try:
             memory_id = int(memory_id)
         except (TypeError, ValueError):
             return {"ok": False, "message": "memory_id must be an integer"}
-    return life.record_memory_feedback(memory_id, feedback_type, note=note, approver=approver)
+    result = life.record_memory_feedback(memory_id, feedback_type, note=note, approver=approver)
+    # Tell the caller what this feedback did to the score, rather than making
+    # them run a separate scored query to find out.
+    if result.get("ok"):
+        try:
+            with connect() as conn:
+                fb = feedback_loop.feedback_for(conn, memory_id)
+            result["signal"] = fb.get("signal", 0.0)
+            result["signal_applied"] = fb.get("applied", False)
+            result["signal_reason"] = fb.get("reason", "")
+        except Exception:
+            pass
+    return result
+
+
+@mcp_gov.tool()
+def summarize_memory_feedback(limit: int = 20) -> dict:
+    """查看反馈信号排行：哪些记忆被反复证明有用、哪些被纠正过。
+
+    只有真正影响评分的记忆才会出现在 top_positive / top_negative 里
+    （至少要 2 条带方向反馈）。retrieved 数量单独列出，仅作曝光参考。
+    """
+    _ensure_db()
+    return feedback_loop.summarize_feedback(limit=limit)
+
+
+@mcp_gov.tool()
+def record_recall(memory_ids: list[int] | None = None) -> dict:
+    """手动记录一批记忆被召回（曝光）。只留痕，不改变任何评分。"""
+    _ensure_db()
+    return feedback_loop.record_retrieved(memory_ids or [])
 
 
 @mcp_gov.tool()
