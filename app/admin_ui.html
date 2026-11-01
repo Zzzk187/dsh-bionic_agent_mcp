@@ -107,6 +107,14 @@
   details{margin-top:6px}
   summary{cursor:pointer;color:var(--muted);font-size:12px}
   pre{background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:10px;overflow:auto;font-size:12px;white-space:pre-wrap}
+  .mem-group { margin-bottom: 18px; }
+  .mem-group-head {
+    display: flex; align-items: center; gap: 10px;
+    margin: 4px 0 8px; padding-bottom: 6px;
+    border-bottom: 1px solid var(--line, #2a2f3a);
+  }
+  .mem-group-title { font-weight: 600; font-size: 13px; }
+  .mem-group-count { color: var(--muted); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -144,9 +152,19 @@
     </label>
     <button id="memSearchBtn">搜索</button>
     <label style="color:var(--muted)"><input type="checkbox" id="memArchived" /> 含归档</label>
+    <select id="memAxis" title="按哪个时间给记忆分档">
+      <option value="created">按创建时间</option>
+      <option value="updated">按更新时间</option>
+    </select>
+    <select id="memGroupBy" title="怎么分组">
+      <option value="day" selected>按天分组</option>
+      <option value="bucket">按时间段分组</option>
+      <option value="none">不分组</option>
+    </select>
     <button class="ghost" id="memRefresh">刷新</button>
     <button id="memNew">+ 新建记忆</button>
   </div>
+  <div id="memTimeline"></div>
   <div id="memList"></div>
 </div>
 
@@ -522,7 +540,7 @@ $$('.tab').forEach(t=>t.onclick=()=>{
   $$('.view').forEach(x=>x.classList.remove('active'));
   t.classList.add('active');
   $('#'+t.dataset.tab).classList.add('active');
-  if(t.dataset.tab==='memories') loadMemories();
+  if(t.dataset.tab==='memories'){ loadMemories(); loadTimeline(); }
   if(t.dataset.tab==='starmap') loadStarMap();
   if(t.dataset.tab==='tasks') loadTasks();
   if(t.dataset.tab==='governance') loadGovStatus();
@@ -1102,14 +1120,152 @@ async function loadMemories(){
       return;
     }
     const list = j.ok ? (j.data.results||[]) : [];
-    $('#memList').innerHTML = list.map(m=>memCard(m, true)).join('') || '<div class="empty">无结果</div>';
+    renderMemoryGroups(list, true);
     return;
   }
   url = `/api/memories?limit=60&category=${encodeURIComponent(cat)}&include_archived=${inc?1:0}`;
   if(q) url += `&q=${encodeURIComponent(q)}`;
   j = await api(url);
-  $('#memList').innerHTML = j.ok ? (j.data.length?j.data.map(m=>memCard(m)).join(''):'<div class="empty">暂无记忆，点「+ 新建记忆」</div>')
-    : `<div class="empty">${esc(j.message)}</div>`;
+  if(!j.ok){ $('#memList').innerHTML = `<div class="empty">${esc(j.message)}</div>`; return; }
+  renderMemoryGroups(j.data || [], false);
+}
+
+// ---------------- 按时间分档 ----------------
+const BUCKETS = [
+  { key:'today',     label:'今天',      lo:0,   hi:1   },
+  { key:'yesterday', label:'昨天',      lo:1,   hi:2   },
+  { key:'week',      label:'近 7 天',   lo:2,   hi:7   },
+  { key:'month',     label:'近 30 天',  lo:7,   hi:30  },
+  { key:'quarter',   label:'近 90 天',  lo:30,  hi:90  },
+  { key:'older',     label:'更早',      lo:90,  hi:null },
+];
+
+// 日期辅助：档头写"今天/昨天/10月29日 周三"，跨年才带年份。
+// 人找记忆是按日期想的，不按"近 30 天"这种区间。
+function dayKey(ts){
+  const d = new Date(ts);
+  const m = String(d.getMonth()+1).padStart(2,'0');
+  const day = String(d.getDate()).padStart(2,'0');
+  return `${d.getFullYear()}-${m}-${day}`;
+}
+function shortDate(key){
+  const d = new Date(key + 'T00:00:00');
+  return `${d.getMonth()+1}/${d.getDate()}`;
+}
+function dayLabel(key){
+  const today = dayKey(Date.now());
+  const yest = dayKey(Date.now() - 86400000);
+  if(key === today) return '今天';
+  if(key === yest) return '昨天';
+  const d = new Date(key + 'T00:00:00');
+  const wd = ['周日','周一','周二','周三','周四','周五','周六'][d.getDay()];
+  const sameYear = d.getFullYear() === new Date().getFullYear();
+  return sameYear
+    ? `${d.getMonth()+1}月${d.getDate()}日 ${wd}`
+    : `${d.getFullYear()}年${d.getMonth()+1}月${d.getDate()}日 ${wd}`;
+}
+
+function parseTs(v){
+  if(!v) return null;
+  const t = Date.parse(String(v).replace(' ', 'T'));
+  return Number.isNaN(t) ? null : t;
+}
+
+function bucketOf(ms){
+  const days = (Date.now() - ms) / 86400000;
+  const d = days < 0 ? 0 : days;   // 时钟漂移导致的"未来"算今天，别让它消失
+  for(const b of BUCKETS){
+    if(d >= b.lo && (b.hi === null || d < b.hi)) return b;
+  }
+  return BUCKETS[BUCKETS.length-1];
+}
+
+// 全库口径的分档条数（和列表当前的查询口径不同，界面上要说清）
+async function loadTimeline(){
+  const axis = $('#memAxis').value;
+  const inc = $('#memArchived').checked;
+  const j = await api(`/api/memories/timeline?axis=${axis}&include_archived=${inc?1:0}`);
+  const box = $('#memTimeline');
+  if(!j.ok){ box.innerHTML = ''; return; }
+  const d = j.data || {};
+  const bs = d.buckets || [];
+  const total = d.total || 0;
+  const days = d.by_day || [];
+  box.innerHTML = `<div class="hint" style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.9">
+    <div><b>全库 ${total} 条</b>（${axis==='created'?'按创建':'按更新'}），分布在 ${d.days||0} 天里</div>
+    <div style="margin-top:4px">
+      ${bs.filter(b=>b.count).map(b=>`<span class="pill" style="margin-right:6px" title="${b.oldest||''} ~ ${b.newest||''}">
+        ${b.label} ${b.count}</span>`).join('')}
+      ${d.unparsed ? `<span>（${d.unparsed} 条时间认不出，未计入）</span>` : ''}
+    </div>
+    <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
+      ${days.slice(0,14).map(r=>`<button class="ghost" data-jump="${r.date}"
+        style="font-size:11px;padding:2px 8px"
+        title="${Object.entries(r.categories).map(([k,v])=>k+' '+v).join('、')}">
+        ${shortDate(r.date)} · ${r.count}</button>`).join('')}
+      ${days.length>14 ? `<span>…共 ${days.length} 天</span>` : ''}
+    </div>
+  </div>`;
+  $$('#memTimeline [data-jump]').forEach(btn=>btn.onclick=()=>{
+    const el = document.getElementById('day_'+btn.dataset.jump);
+    if(el) el.scrollIntoView({behavior:'smooth', block:'start'});
+  });
+}
+
+// 把当前查询结果按时间分档渲染
+function renderMemoryGroups(list, showScore){
+  if(!list.length){
+    $('#memList').innerHTML = '<div class="empty">暂无记忆，点「+ 新建记忆」</div>';
+    return;
+  }
+  const mode = $('#memGroupBy').value;
+  if(mode === 'none'){
+    $('#memList').innerHTML = list.map(m=>memCard(m, showScore)).join('');
+    return;
+  }
+  const axis = $('#memAxis').value === 'updated' ? 'updated_at' : 'created_at';
+  const keyOf = (ts) => mode === 'day'
+      ? dayKey(ts)
+      : bucketOf(ts).key;
+  const groups = new Map();
+  let unparsed = [];
+  for(const m of list){
+    const ts = parseTs(m[axis]) ?? parseTs(m.created_at);
+    if(ts === null){ unparsed.push(m); continue; }
+    const k = keyOf(ts);
+    if(!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(m);
+  }
+  // 按天的键本身可排序（2026-10-29），按档的键按 BUCKETS 顺序
+  const keys = mode === 'day'
+      ? [...groups.keys()].sort().reverse()
+      : BUCKETS.map(b=>b.key).filter(k=>groups.has(k));
+  const parts = [];
+  for(const k of keys){
+    const rows = groups.get(k);
+    const title = mode === 'day' ? dayLabel(k) : (BUCKETS.find(b=>b.key===k)?.label || k);
+    const anchor = mode === 'day' ? ` id="day_${k}"` : '';
+    const cats = {};
+    rows.forEach(m=>{ const c = m.category||'general'; cats[c]=(cats[c]||0)+1; });
+    parts.push(`<div class="mem-group"${anchor}>
+      <div class="mem-group-head">
+        <span class="mem-group-title">${esc(title)}</span>
+        <span class="mem-group-count">${rows.length} 条</span>
+        <span class="mem-group-count">${Object.entries(cats).map(([c,n])=>`${esc(c)} ${n}`).join(' · ')}</span>
+      </div>
+      ${rows.map(m=>memCard(m, showScore)).join('')}
+    </div>`);
+  }
+  if(unparsed.length){
+    parts.push(`<div class="mem-group">
+      <div class="mem-group-head">
+        <span class="mem-group-title">时间未知</span>
+        <span class="mem-group-count">${unparsed.length} 条</span>
+      </div>
+      ${unparsed.map(m=>memCard(m, showScore)).join('')}
+    </div>`);
+  }
+  $('#memList').innerHTML = parts.join('');
 }
 function memCard(m, showScore=false){
   const arch = m.status==='archived';
@@ -1145,7 +1301,9 @@ function memCard(m, showScore=false){
   </div>`;
 }
 $('#memSearchBtn').onclick = loadMemories;
-$('#memRefresh').onclick = ()=>{loadMemories();loadCategories();};
+$('#memRefresh').onclick = ()=>{loadMemories();loadCategories();loadTimeline();};
+$('#memAxis').onchange = ()=>{loadMemories();loadTimeline();};
+$('#memGroupBy').onchange = loadMemories;
 $('#memArchived').onchange = loadMemories;
 $('#memSearch').onkeydown = e=>{if(e.key==='Enter') loadMemories();};
 
@@ -1601,6 +1759,7 @@ $('#govConsol').onclick = async ()=>{
   await loadStats();
   await loadCategories();
   await loadMemories();
+  await loadTimeline();   // 概览条要全库口径，不能等用户点刷新
 })();
 </script>
 </body>

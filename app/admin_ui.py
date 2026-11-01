@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import uuid
+from datetime import datetime
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -91,6 +92,31 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # 小工具
 # ---------------------------------------------------------------------------
+def _parse_ts(value):
+    """把库里各种写法的时间戳解析成 datetime；认不出就返回 None。
+
+    见过的格式：`2026-10-29 15:58:58`、`2026-10-29T15:58:58`、
+    带微秒/时区的 ISO。认不出时调用方会把这条计入 unparsed 并如实报告，
+    而不是假装它属于某个档。
+    """
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip().replace("Z", "+00:00")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    try:
+        parsed = datetime.fromisoformat(text)
+        return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+    except ValueError:
+        return None
+
+
 def _ok(data):
     return JSONResponse(content={"ok": True, "data": data})
 
@@ -140,6 +166,93 @@ def api_create_memory(payload: dict):
         float(payload.get("confidence", 0.8) or 0.8),
         tags,
     )
+
+
+# 必须放在 /api/memories/{memory_id} 之前：否则 "timeline" 会被当成 id。
+@app.get("/api/memories/timeline")
+def api_memories_timeline(axis: str = Query("created", pattern="^(created|updated)$"),
+                          include_archived: bool = Query(False)):
+    """全库按时间分档：今天 / 昨天 / 近 7 天 / 近 30 天 / 近 90 天 / 更早。
+
+    返回每档的条数与日期范围。axis 选按创建时间还是更新时间分组——
+    前者回答「什么时候记的」，后者回答「最近在用的有哪些」。
+    """
+    from app.db import connect
+    col = "created_at" if axis == "created" else "updated_at"
+    statuses = "('active','archived')" if include_archived else "('active')"
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT {col} AS ts, category FROM memories "
+            f"WHERE status IN {statuses} AND memory_status != 'pending_review'"
+        ).fetchall()
+    now = datetime.now()
+    buckets = [
+        ("today", "今天", 0, 1),
+        ("yesterday", "昨天", 1, 2),
+        ("week", "近 7 天", 2, 7),
+        ("month", "近 30 天", 7, 30),
+        ("quarter", "近 90 天", 30, 90),
+        ("older", "更早", 90, None),
+    ]
+    out = {key: {"key": key, "label": label, "count": 0,
+                 "oldest": None, "newest": None, "categories": {}}
+           for key, label, _lo, _hi in buckets}
+    unparsed = 0
+    for r in rows:
+        ts = _parse_ts(r["ts"])
+        if ts is None:
+            unparsed += 1
+            continue
+        days = (now - ts).total_seconds() / 86400.0
+        if days < 0:
+            days = 0.0  # 时钟漂移导致的"未来"时间按今天算，别让它凭空消失
+        for key, _label, lo, hi in buckets:
+            if days >= lo and (hi is None or days < hi):
+                b = out[key]
+                b["count"] += 1
+                cat = (r["category"] or "general")
+                b["categories"][cat] = b["categories"].get(cat, 0) + 1
+                iso = ts.strftime("%Y-%m-%d")
+                if b["oldest"] is None or iso < b["oldest"]:
+                    b["oldest"] = iso
+                if b["newest"] is None or iso > b["newest"]:
+                    b["newest"] = iso
+                break
+    ordered = [out[k] for k, _l, _lo, _hi in buckets]
+
+    # 按自然日聚合，最新在前。相对档回答"整体新鲜度"，日聚合才回答
+    # "哪天记了什么" —— 前者太粗（36 条会全压在"近 30 天"一档），
+    # 真正能定位的是日期。
+    by_day: dict[str, dict] = {}
+    for r in rows:
+        ts = _parse_ts(r["ts"])
+        if ts is None:
+            continue
+        # 和上面的相对档保持同一口径：未来时间按今天算。否则同一条记忆在
+        # 「今天 3 条」和 by_day 的日期列表里会给出两种说法（一个是今天、
+        # 一个是明天），而两个数字都出现在同一块界面上。
+        if ts > now:
+            ts = now
+        day = ts.strftime("%Y-%m-%d")
+        slot = by_day.get(day)
+        if slot is None:
+            slot = by_day[day] = {"date": day, "count": 0, "categories": {},
+                                  "ids": []}
+        slot["count"] += 1
+        cat = (r["category"] or "general")
+        slot["categories"][cat] = slot["categories"].get(cat, 0) + 1
+    days = sorted(by_day.values(), key=lambda x: x["date"], reverse=True)
+
+    return _ok({
+        "axis": axis,
+        "total": len(rows) - unparsed,
+        "buckets": ordered,
+        "by_day": days,
+        "days": len(days),
+        "unparsed": unparsed,
+        "note": "分档按相对天数算，所以「今天/昨天」会随时间推移而移动，"
+                "不是固定的日期区间。",
+    })
 
 
 @app.get("/api/memories/{memory_id}")
