@@ -6,7 +6,7 @@
 
 - 数据全部落在本地 SQLite（`data/agent.db`），无云端调用、无 API Key。
 - 向量模型用 FastEmbed / ONNX 本地推理，首次使用自动下载一次后离线可用。
-- 提供两个可分开挂载的 MCP 实例：**核心 21 工具**（日常）+ **治理 33 工具**（按需），同一个数据库、同一套后端，无重复逻辑。
+- 提供两个可分开挂载的 MCP 实例：**核心 21 工具**（日常）+ **治理 45 工具**（按需），同一个数据库、同一套后端，无重复逻辑。
 
 ---
 
@@ -18,10 +18,14 @@
 | 检索 | `search_memories`（关键词）/ `find_related_memories`（关联）/ `semantic_search_memories`（向量语义）/ `get_memory_links` / `link_memories` | 关键词、关联、真实向量三种检索并存 |
 | 任务 | `create_task` / `list_tasks` / `get_task` / `save_stage_snapshot` / `handoff_task` / `resume_task` / `complete_task` / `list_events` | 多阶段交接，自动生成初始 plan |
 | 嵌入 | `embedding_status` / `index_memories` | 查看模型、建立/刷新向量索引 |
-| 治理（治理实例） | 33 个：评分 `score_memories`、冲突 `detect_memory_conflicts`、保护 `protect_memory`、整理闭环 `run_memory_maintenance`、向量一致性 `get_vector_consistency`、融合召回 `recall_memories`、激活扩散 `spread_activation`、生命周期 `memory_lifecycle`、关系子图 `get_related_memories` 等 | 见下方"治理实例"章节 |
+| 治理（治理实例） | 45 个：评分 `score_memories`、冲突 `detect_memory_conflicts`、保护 `protect_memory`、整理闭环 `run_memory_maintenance`、向量一致性 `get_vector_consistency`、融合召回 `recall_memories`、激活扩散 `spread_activation`、生命周期 `memory_lifecycle`、关系子图 `get_related_memories` 等 | 见下方"治理实例"章节 |
+| 反馈闭环 | `record_memory_feedback` / `record_recall` / `summarize_memory_feedback` | 用到/有用/被纠正会真实移动可信度；**曝光（retrieved）永不计分** |
+| 整库快照 | `create_db_snapshot` / `list_db_snapshots` / `restore_db_snapshot` / `check_vector_consistency` / `prune_db_snapshots` | 单动作回滚之外的兜底；恢复前自动先给当前状态拍一张 |
+| 分档保护 | `assess_memory_protection` / `summarize_protection` | critical/high/normal/low 由分数与类别推导，只收紧不放松 |
+| 记忆提炼 | `find_distillation_candidates` / `apply_distillation` / `list_distillations` | 规则找候选 + 证据链；结论由人/模型撰写，`derived_from` 挂回来源 |
 
 **核心实例 `bionic-agent`：21 个工具。** 日常使用只挂它即可，固定工具清单 token 成本低。
-**治理实例 `bionic-agent-governance`：33 个工具。** 需要记忆治理/整理/融合召回时再挂。
+**治理实例 `bionic-agent-governance`：45 个工具。** 需要记忆治理/整理/融合召回时再挂。
 
 > 注：因 handoff_task 历史 bug 已修复——现在 handoff 会一并返回展开后的 `task.plan`（结构化对象），不再是 `plan_json` 字符串。
 
@@ -91,7 +95,7 @@ python -m venv .venv
 > 治理入口已内置 sys.path 兜底，但**统一用 `-m app.mcp_server_gov` 最省心**。
 > 参考文件：`deepseek-harness-mcp.example.yml`。
 
-重启宿主后，核心实例应可立即调用；治理实例挂载后即可用上 33 个治理工具。
+重启宿主后，核心实例应可立即调用；治理实例挂载后即可用上 45 个治理工具。
 
 ---
 
@@ -363,6 +367,58 @@ bionic-agent-mcp/
 
 ---
 
+## 五个"不显然"的设计决定
+
+这几处看起来可以更简单，但简单版本会在真实使用里悄悄出错，所以写在这里，
+免得以后被"优化"回原样。
+
+### 1. 曝光不计分（`app/feedback_loop.py`）
+
+`retrieved` 计数器永远贡献 0.0 分。如果它加分，被召回最多的记忆会持续胜出 →
+被召回更多 → 自我固化。那是在优化"被返回"而不是"正确"。
+
+分三层：`retrieved` 只记录（纯审计）、`used` 小正、`helpful` 最强正、`not_relevant` 弱负、
+`corrected` 强负。带方向的反馈少于 2 条不生效（单条是噪声），单次调整上限 ±25%，
+且是**乘性**的——高分不会被压到 0，低分不会被顶到 100。
+
+### 2. 分档只收紧、绝不放松（`app/protection.py`）
+
+`critical/high/normal/low` 由分数与类别推导，不靠人记得设 flag。关键约束：
+分档不会把一条记忆"升级"成现有阈值本来会拒绝的自动动作。**能触发破坏性操作的安全轴
+不是安全轴。** 调用方查 `blocks` 字典（机器可读）而不是比 tier 字符串，这样以后加档
+不会静默放宽权限。
+
+一个具体的判断顺序错误被测试抓到过：`temp` 类别 importance=75 时先命中高分带成了
+`high`。修法是把"临时类别"判断移到分数带之前——**一次临时笔记被访问很多次仍然是
+临时笔记**，让分数在这里胜出会重新制造分档本来要解决的问题。
+
+### 3. 快照是逻辑 dump 不是文件拷贝（`app/snapshots.py`）
+
+另一个进程持写锁时直接拷 `agent.db` 会得到撕裂文件；事务内 dump 行在 WAL 下视图一致。
+payload 落盘、元数据进库（向量太大不塞 SQLite 行，库里存 sha256 便于发现损坏）。
+恢复是**单事务、全成或全不成**——部分恢复比不恢复更糟。恢复前自动先给当前状态拍一张，
+所以恢复本身可逆。恢复后不自动重建向量，如实报告 `vector_check`。
+
+### 4. 提炼停在候选，不生成结论（`app/distillation.py`）
+
+规则能可靠地找出"同一主题下的多条经历"，但写不出抽象结论。任何声称能做的规则，
+实质上就是复制某一条原句当新记忆——看起来像总结，实际是重复一行，比不做更糟。
+
+所以：候选里**没有** `content` 字段；来源少于 3 条直接拒绝（并提示改用 `save_memory`，
+那是断言新事实而非提炼）。
+
+### 5. 并发靠原子操作，不靠"先查后改"（`app/db.py`）
+
+6 个进程同时启动曾崩 3 个：`sqlite3.OperationalError: duplicate column name: supersedes_id`。
+根因是「先 `PRAGMA table_info` 查、再 ALTER」两条语句之间的窗口。现在所有加列都走
+`_add_column_if_missing()`，遇到 `duplicate column name` 视为"别人已加好"返回 False。
+
+配套：`connect()` 统一 `busy_timeout`（默认 30s，`BIONIC_DB_BUSY_TIMEOUT` 可调）+ WAL +
+`synchronous=NORMAL`；`transaction()` 用 `BEGIN IMMEDIATE`——deferred 事务先读后写会被
+提升并报 `SQLITE_BUSY_SNAPSHOT`，而 busy_timeout **不重试**这个错误。
+
+---
+
 ## 可移植 / 传播要点
 
 - **路径零硬编码**：所有路径基于 `Path(__file__).resolve()`，换机器只改 MCP 配置里的绝对路径。
@@ -406,7 +462,12 @@ bionic-agent-mcp/
 |---|---|
 | `tests/smoke_test.py` | DB 迁移与记忆读写（离线，临时库） |
 | `tests/embedding_test.py` | 向量持久化兼容 |
-| `tests/verify_mcp_split_test.py` | 双实例工具注册验证（核心 21 + 治理 33 = 54） |
+| `tests/verify_mcp_split_test.py` | 双实例工具注册验证（核心 21 + 治理 45 = 66） |
+| `tests/concurrency_test.py` | 6 进程并发建库/写、跨进程持锁等待、busy_timeout 可配（8 项） |
+| `tests/feedback_loop_test.py` | 反馈闭环：retrieved 不计分、分层权重、±25% 上限、端到端分数真会动（26 项） |
+| `tests/snapshot_test.py` | 整库快照/恢复：sha256 校验、中途失败整库回滚、id 序列重置（31 项） |
+| `tests/protection_test.py` | 分档保护：四档判定、只收紧不放松、接入归档与合并（28 项） |
+| `tests/distillation_test.py` | 提炼：簇发现、证据不足拒绝、derived_from 溯源、被反驳可检出（32 项） |
 
 示例用法：
 
@@ -415,6 +476,9 @@ node dsh-panel-client/test/all.mjs
 .venv/Scripts/python tests/smoke_test.py
 .venv/Scripts/python tests/verify_mcp_split_test.py
 ```
+
+> 这些测试都跑真实 SQLite（临时库），不用 mock。凡是"分数应该动"的断言，都盯
+> 具体数值是否变化——只查计数增长的测试在坏代码上也会通过。
 
 > 仅保留上述可长期维护的核心回归测试。数据库迁移逻辑已内联进 `app/db.py`，
 > 首次启动 `init_db()` 自动幂等执行，无需单独迁移脚本。
