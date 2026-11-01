@@ -11,6 +11,12 @@ DB_PATH = Path(
     or (Path(__file__).resolve().parent.parent / "data" / "agent.db")
 )
 
+# Two MCP servers and the Web panel may write the same file concurrently.
+# SQLite allows one writer at a time; this is how long a losing writer waits
+# for the lock before giving up. 30s is generous for the small transactions
+# here and still far from "hang forever".
+BUSY_TIMEOUT_SECONDS = float(os.environ.get("BIONIC_DB_BUSY_TIMEOUT", "30"))
+
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     # NOTE: `with sqlite3.connect(...)` only commits on exit, it never closes the
@@ -59,15 +65,18 @@ def init_db():
         );
         """)
         # Additive migrations: preserve existing data and old databases.
-        memory_columns = {r[1] for r in conn.execute("PRAGMA table_info(memories)")}
-        if "tags_json" not in memory_columns:
-            conn.execute("ALTER TABLE memories ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'")
-        if "expires_at" not in memory_columns:
-            conn.execute("ALTER TABLE memories ADD COLUMN expires_at TEXT")
-        if "supersedes_id" not in memory_columns:
-            conn.execute("ALTER TABLE memories ADD COLUMN supersedes_id INTEGER")
-        if "conflict_group" not in memory_columns:
-            conn.execute("ALTER TABLE memories ADD COLUMN conflict_group TEXT")
+        #
+        # These go through _add_column_if_missing rather than inline
+        # `if "x" not in columns: ALTER ...` because two MCP instances can
+        # start at the same moment against the same new file: both read the
+        # column list before either commits, then both try to add the column
+        # and the loser dies with "duplicate column name". That is a real
+        # startup crash, not a theoretical race -- reproduced with 6 processes
+        # where 3 failed.
+        _add_column_if_missing(conn, "memories", "tags_json", "TEXT NOT NULL DEFAULT '[]'")
+        _add_column_if_missing(conn, "memories", "expires_at", "TEXT")
+        _add_column_if_missing(conn, "memories", "supersedes_id", "INTEGER")
+        _add_column_if_missing(conn, "memories", "conflict_group", "TEXT")
         conn.execute("CREATE TABLE IF NOT EXISTS memory_links ("
                      "id INTEGER PRIMARY KEY AUTOINCREMENT,"
                      "source_memory_id INTEGER NOT NULL,"
@@ -114,10 +123,23 @@ PHASE5_MEMORY_COLUMNS = [
 
 
 def _add_column_if_missing(conn, table: str, column: str, ddl: str) -> bool:
+    """Add a column if absent; return True only if this call actually added it.
+
+    The check and the ALTER are two statements, so two processes starting at the
+    same moment can both observe the column missing and both try to add it. The
+    loser gets "duplicate column name" -- which is not an error here, it means
+    the other instance already did the work. Treating that as success keeps
+    startup idempotent across processes.
+    """
     existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
     if column in existing:
         return False
-    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" in str(exc).lower():
+            return False          # someone else won the race
+        raise
     return True
 
 
@@ -312,8 +334,23 @@ def init_db_phase5() -> dict:
 
 @contextmanager
 def connect():
-    conn = sqlite3.connect(DB_PATH)
+    """Open a connection with settings that survive multi-process writes.
+
+    Three instances may write the same file at once (two MCP servers + the Web
+    panel). SQLite serialises writers with a file lock; without a busy handler
+    a losing writer fails immediately with "database is locked" instead of
+    waiting its turn. `timeout=` installs that handler, and the PRAGMAs make
+    the wait explicit and bounded rather than relying on the 5s Python default.
+
+    WAL is set once at creation time and persists in the file header, but it is
+    re-asserted here because it is cheap and makes the mode explicit on every
+    connection (a non-WAL file would otherwise block readers during writes).
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=%d" % int(BUSY_TIMEOUT_SECONDS * 1000))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     try:
         yield conn
@@ -330,10 +367,16 @@ def transaction():
     committing whatever happened to succeed. `connect()` keeps its original
     behaviour so Phases 1-4 are unaffected.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=%d" % int(BUSY_TIMEOUT_SECONDS * 1000))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("BEGIN")
+    # IMMEDIATE takes the write lock up front. With the default deferred BEGIN a
+    # read-then-write transaction can be promoted mid-flight and fail with
+    # SQLITE_BUSY_SNAPSHOT, which busy_timeout does NOT retry.
+    conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
         conn.commit()
