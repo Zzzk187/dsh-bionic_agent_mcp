@@ -37,7 +37,10 @@ from app import memory_lifecycle as life  # noqa: E402
 from app import embeddings as emb  # noqa: E402
 from app import snapshots as snap  # noqa: E402
 from app import protection as protect  # noqa: E402
-from app import distillation as distill  # noqa: E402
+from app import distillation as distill
+from app import task_resume as resume_mod
+from app import recall_profile as recall_prof
+from app import expiry as expiry_mod  # noqa: E402
 from app import feedback_loop as feedback  # noqa: E402
 from app.db import rowdict as db_rowdict  # noqa: E402
 
@@ -508,6 +511,94 @@ def api_distill_apply(payload: dict):
                 float(payload.get("confidence", 0.7)),
                 payload.get("note", "") or "")
 
+
+# ---------------------------------------------------------------------------
+# 任务续跑
+# ---------------------------------------------------------------------------
+# 注意路径：不能写成 /api/tasks/stuck —— `/api/tasks/{task_id}` 声明在前面，
+# FastAPI 按声明顺序匹配，"stuck" 会被当成 task_id 解析成 int 后 422。
+# 所以续跑相关接口统一放在 /api/task-resume 下，与 tasks 动态路由家族分离。
+@app.get("/api/task-resume/stuck")
+def api_task_resume_stuck(stuck_hours: float = Query(24.0, ge=0.1, le=8760),
+                          limit: int = Query(50, ge=1, le=200)):
+    """卡住的任务。只报告不自动重试——该不该继续跑是人的决定，不是时间的函数。"""
+    return _run(resume_mod.find_stuck_tasks, stuck_hours, limit)
+
+
+@app.get("/api/task-resume/{task_id}/packet")
+def api_task_resume_packet(task_id: int):
+    """续跑包。带不到上下文时 context_available 会是 false，而不是假装有。"""
+    return _run(resume_mod.build_resume_packet, task_id)
+
+
+# ---------------------------------------------------------------------------
+# 记忆有效期
+# ---------------------------------------------------------------------------
+@app.get("/api/expiry/scan")
+def api_expiry_scan(limit: int = Query(200, ge=1, le=1000),
+                    include_protected: bool = Query(False)):
+    """列出已过期的记忆。只是清单，不改任何数据。"""
+    return _run(expiry_mod.scan_expired, limit, include_protected)
+
+
+@app.post("/api/expiry/run")
+def api_expiry_run(payload: dict | None = None):
+    """默认 dry_run；archive=True 也只送 pending_review，不直接归档。
+
+    注意：这个接口声明在 `/api/memories/{memory_id}...` 之前，且 /api/expiry
+    与 memories 家族不冲突。
+    """
+    payload = payload or {}
+    return _run(expiry_mod.run_expiry,
+                bool(payload.get("dry_run", True)),
+                int(payload.get("limit", 200)),
+                bool(payload.get("archive", False)))
+
+
+@app.post("/api/memories/{memory_id}/expiry")
+def api_set_expiry(memory_id: int, payload: dict | None = None):
+    """给一条记忆设有效期。长期类（preference/fact 等）会被明确拒绝并说明原因。"""
+    payload = payload or {}
+    return _run(core.set_memory_expiry, memory_id,
+                float(payload.get("days", 0) or 0),
+                str(payload.get("expires_at", "") or ""))
+
+
+# ---------------------------------------------------------------------------
+# 召回画像（预览，不查库）
+# ---------------------------------------------------------------------------
+@app.get("/api/recall/profile")
+def api_recall_profile(query: str = "", memory_type: str = ""):
+    info = recall_prof.weights_for(memory_type=memory_type, query=query)
+    return _ok({
+        "rule_version": recall_prof.PROFILE_RULE_VERSION,
+        "shape": info["shape"],
+        "profile": info["profile"],
+        "weights": info["weights"],
+        "reasons": info["reasons"],
+        # 默认表就是 life.RECALL_WEIGHTS（TYPE_PROFILES 里没有 default 键）。
+        # 显式返回它，前端才能把"本次权重"和"默认权重"并排比，看出画像到底动了什么。
+        "default_weights": dict(life.RECALL_WEIGHTS),
+        "type_profiles": recall_prof.TYPE_PROFILES,
+        "shape_shift": recall_prof.SHAPE_WEIGHT_SHIFT,
+    })
+
+
+@app.post("/api/recall/backfill-types")
+def api_backfill_types(payload: dict | None = None):
+    """补 memory_type。默认干跑——它只改排序，但改了就是改了。"""
+    payload = payload or {}
+    return _run(core.backfill_memory_types,
+                bool(payload.get("dry_run", True)),
+                int(payload.get("limit", 500)))
+
+
+# ---------------------------------------------------------------------------
+# 取值冲突（同一件事的两种取值，建议都保留）
+# ---------------------------------------------------------------------------
+@app.get("/api/conflicts/value")
+def api_value_conflicts(limit: int = Query(50, ge=1, le=200)):
+    return _run(gov.list_conflicts, None, "", limit)
 
 
 # ---------------------------------------------------------------------------

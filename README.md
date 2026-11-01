@@ -23,6 +23,10 @@
 | 整库快照 | `create_db_snapshot` / `list_db_snapshots` / `restore_db_snapshot` / `check_vector_consistency` / `prune_db_snapshots` | 单动作回滚之外的兜底；恢复前自动先给当前状态拍一张 |
 | 分档保护 | `assess_memory_protection` / `summarize_protection` | critical/high/normal/low 由分数与类别推导，只收紧不放松 |
 | 记忆提炼 | `find_distillation_candidates` / `apply_distillation` / `list_distillations` | 规则找候选 + 证据链；结论由人/模型撰写，`derived_from` 挂回来源 |
+| 任务续跑 | `get_resume_packet` / `find_stuck_tasks` / `fail_task` | 续跑带真实快照上下文或明说带不了；不虚报进度；卡住只报告不自动重试 |
+| 记忆有效期 | `set_memory_expiry` / `scan_expired_memories` / `run_expiry_policy`（`save_memory(ttl_days=...)`） | 只对临时类生效；**过期只降权不删除**；默认 dry_run、送审不直接归档 |
+| 召回画像 | `backfill_memory_types`（`recall_memories` 自带） | 按记忆类型/问句形态选权重画像，结果回显画像名；只改比重不改成分 |
+| 取值冲突 | （`detect_memory_conflicts` 内置 `value_conflict`） | 同骨架不同数值判为取值矛盾，建议两条都保留，不再当重复归档 |
 
 **核心实例 `bionic-agent`：21 个工具。** 日常使用只挂它即可，固定工具清单 token 成本低。
 **治理实例 `bionic-agent-governance`：45 个工具。** 需要记忆治理/整理/融合召回时再挂。
@@ -399,7 +403,50 @@ payload 落盘、元数据进库（向量太大不塞 SQLite 行，库里存 sha
 恢复是**单事务、全成或全不成**——部分恢复比不恢复更糟。恢复前自动先给当前状态拍一张，
 所以恢复本身可逆。恢复后不自动重建向量，如实报告 `vector_check`。
 
-### 4. 提炼停在候选，不生成结论（`app/distillation.py`）
+### 4. 过期只降权，不删除（`app/expiry.py`）
+
+过期记忆通常**仍然正确**，只是不再当令。过滤掉会让它彻底查不到——而"三个月前
+的端口号"这类信息恰恰在排查旧问题时最有用。所以过期只扣 15% 召回分并在结果里
+标 `_expired`，内容与可检索性都保留。
+
+另外两个刻意的取法：带 24h 宽限期（时钟/时区出错时不会一锅端）；`run_expiry_policy`
+默认 dry_run，即使 `archive=True` 也只送 `pending_review` 不直接归档。
+
+`save_memory(ttl_days=...)` 对 `preference`/`fact`/`identity` 这类**明确拒绝并说明原因**，
+而不是静默忽略——静默忽略会让调用方以为自己设了有效期，实际永远不过期。
+
+### 5. 召回画像只改比重，不改成分（`app/recall_profile.py`）
+
+`RECALL_WEIGHTS` 原本是写死常量，而 `memory_type` 有 7 类却完全没用在召回上、
+真实库里 38 条全是 NULL。现在按类型/问句形态选画像，但有三条硬约束：
+
+- 任何权重不许归零，也不许超过 0.5（否则一句问法就能让某条记忆查不到）
+- 类型乘子限在 `[0.5, 1.5]`，且未命中时为 1.0（不惩罚）
+- 结果里回显画像名与权重，排序异常能追到「哪个画像」而不是猜
+
+**两种维度不能混**：权重表的 key 是**成分**（semantic/freshness/frequency），
+记忆类型名（episodic/procedural）是**候选属性**，只能作每条的软先验。
+第一版把两者塞进同一张表，`bump.get("freshness")` 永远取不到值，形态画像与
+默认表逐项相同——整个分支静默空转，而测试照样绿。
+
+写入时自动归类是必要的配套：字段全是 NULL 时，再好的画像也是空转。
+
+### 6. 同一件事的两种取值不是重复（`app/governance_conflicts.py`）
+
+```
+A: DSH 桌面版每次重启端口都会变，这次是 59647
+B: DSH 桌面版每次重启端口都会变，这次是 51366
+相似度 0.882 -> 旧逻辑判 duplicate -> 建议 archive_duplicate
+```
+
+文本几乎一致时，唯一的差异往往正是数字，而数字正是事实本身。判成重复并归档，
+等于把一个真实存在过的端口号列为垃圾。新规则：双方都有数值且不等、同时抹掉数字
+后的骨架相似度 ≥ 0.80 → `value_conflict`，建议两条都保留并各自标注生效时间。
+
+刻意**不猜哪个值对**：规则只能发现两个数不一样，判断哪个是当前有效值需要时间和
+上下文，那属于人。
+
+### 7. 提炼停在候选，不生成结论（`app/distillation.py`）
 
 规则能可靠地找出"同一主题下的多条经历"，但写不出抽象结论。任何声称能做的规则，
 实质上就是复制某一条原句当新记忆——看起来像总结，实际是重复一行，比不做更糟。
@@ -407,7 +454,7 @@ payload 落盘、元数据进库（向量太大不塞 SQLite 行，库里存 sha
 所以：候选里**没有** `content` 字段；来源少于 3 条直接拒绝（并提示改用 `save_memory`，
 那是断言新事实而非提炼）。
 
-### 5. 并发靠原子操作，不靠"先查后改"（`app/db.py`）
+### 8. 并发靠原子操作，不靠"先查后改"（`app/db.py`）
 
 6 个进程同时启动曾崩 3 个：`sqlite3.OperationalError: duplicate column name: supersedes_id`。
 根因是「先 `PRAGMA table_info` 查、再 ALTER」两条语句之间的窗口。现在所有加列都走
@@ -467,7 +514,11 @@ payload 落盘、元数据进库（向量太大不塞 SQLite 行，库里存 sha
 | `tests/feedback_loop_test.py` | 反馈闭环：retrieved 不计分、分层权重、±25% 上限、端到端分数真会动（26 项） |
 | `tests/snapshot_test.py` | 整库快照/恢复：sha256 校验、中途失败整库回滚、id 序列重置（31 项） |
 | `tests/protection_test.py` | 分档保护：四档判定、只收紧不放松、接入归档与合并（28 项） |
-| `tests/distillation_test.py` | 提炼：簇发现、证据不足拒绝、derived_from 溯源、被反驳可检出（32 项） |
+| `tests/distillation_test.py` | 提炼：簇发现、链式串联防回归、证据不足拒绝、derived_from 溯源、被反驳可检出（37 项） |
+| `tests/task_resume_test.py` | 任务续跑：无快照必须诚实说带不了、不虚报 plan 进度、retry_count 持久化（42 项） |
+| `tests/expiry_test.py` | 有效期：临时类可设/长期类拒绝、过期降权不删除、24h 宽限、dry_run 不改数据（37 项） |
+| `tests/recall_profile_test.py` | 召回画像：权重不归零不主导、画像确实改变算分、类型乘子有界、写入自动归类（62 项） |
+| `tests/conflict_triage_test.py` | 取值冲突：同骨架不同数值不判重复、真重复仍抓得到、MCP 端到端（28 项） |
 
 示例用法：
 

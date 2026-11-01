@@ -252,6 +252,38 @@
            style="width:80px" title="簇内相似度阈值" />
   </div>
   <div id="distOut"></div>
+
+  <h3 style="margin-top:22px">召回画像</h3>
+  <div class="hint" style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.6">
+    同一条记忆，问「怎么配置」和问「我喜欢什么」时该用不同的权重。这里能预览某个问句
+    会选中哪个画像。<b>画像只改比重，不改成分</b>：任何权重不会归零，也不会独占。
+  </div>
+  <div class="toolbar">
+    <input id="recallQ" placeholder="输入一个问题，看它选哪个画像" style="width:280px" />
+    <select id="recallType" style="width:150px">
+      <option value="">（不指定类型）</option>
+      <option value="preference">preference</option>
+      <option value="procedural">procedural</option>
+      <option value="episodic">episodic</option>
+      <option value="reflection">reflection</option>
+      <option value="goal">goal</option>
+    </select>
+    <button id="recallGo">预览权重</button>
+    <button class="ghost" id="recallBackfill">补记忆类型（干跑）</button>
+  </div>
+  <div id="recallOut"></div>
+
+  <h3 style="margin-top:22px">任务续跑</h3>
+  <div class="hint" style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.6">
+    续跑包要么带着真实快照上下文，要么明确告诉你带不了 —— 而不是给你一个看着像有、
+    实际是空的上下文。<b>卡住的任务只报告，不自动重试</b>：重启后该不该继续跑是你的决定。
+  </div>
+  <div class="toolbar">
+    <button id="stuckGo">看看卡住的任务</button>
+    <input id="resumeId" type="number" min="1" placeholder="任务 id" style="width:100px" />
+    <button class="ghost" id="resumeGo">取续跑包</button>
+  </div>
+  <div id="resumeOut"></div>
 </div>
 
 <!-- 编辑/新建 记忆 Modal -->
@@ -1384,6 +1416,116 @@ async function loadDistillations(){
 }
 
 $('#distList').onclick = loadDistillations;
+// ---------------- 召回画像 ----------------
+$('#recallGo').onclick = async ()=>{
+  const q = encodeURIComponent($('#recallQ').value || '');
+  const t = encodeURIComponent($('#recallType').value || '');
+  const j = await api(`/api/recall/profile?query=${q}&memory_type=${t}`);
+  if(!j.ok){ $('#recallOut').innerHTML = `<div class="empty">${esc(j.message||'失败')}</div>`; return; }
+  const d = j.data || {};
+  const w = d.weights || {};
+  const base = d.default_weights || d.type_profiles?.default || {};
+  const order = ['semantic','keyword','importance','confidence','freshness','frequency','activation'];
+  $('#recallOut').innerHTML = `
+    <div style="margin:8px 0 6px">
+      <span class="pill">问句形态：${esc(d.shape||'unknown')}</span>
+      <span class="pill">画像：${esc(d.profile||'default')}</span>
+    </div>
+    <table>
+      <tr><th>成分</th><th>默认权重</th><th>本次权重</th><th>变化</th></tr>
+      ${order.map(k=>{
+        const now = typeof w[k]==='number' ? w[k] : null;
+        const def = typeof base[k]==='number' ? base[k] : null;
+        let delta = '—';
+        if(now!==null && def!==null){
+          const dv = now - def;
+          delta = Math.abs(dv) < 1e-9 ? '不变'
+                : `<span style="color:${dv>0?'var(--ok, #4c9)':'var(--muted)'}">${dv>0?'+':''}${(dv*100).toFixed(1)}%</span>`;
+        }
+        return `<tr><td>${k}</td><td>${def===null?'—':def.toFixed(4)}</td>
+                <td>${now===null?'—':now.toFixed(4)}</td><td>${delta}</td></tr>`;
+      }).join('')}
+    </table>
+    <div class="hint" style="margin-top:8px;color:var(--muted);font-size:12px">
+      ${(d.reasons||[]).map(r=>esc(r)).join('；') || '没有特别的调权理由。'}
+    </div>`;
+};
+
+$('#recallBackfill').onclick = async ()=>{
+  const j = await api('/api/recall/backfill-types', {method:'POST', body:JSON.stringify({dry_run:true})});
+  if(!j.ok){ toast(j.message||'失败', 'err'); return; }
+  const d = j.data || {};
+  const items = d.items || [];
+  $('#recallOut').innerHTML = `
+    <div class="hint" style="margin-bottom:8px">
+      干跑：扫描 ${d.candidates_scanned||0} 条，会补 ${d.would_set||0} 条，需人工确认 ${d.need_review||0} 条。
+      <b>没有写库</b> —— 补类型只影响召回排序，但改了就是改了，所以要你点第二次才动手。
+    </div>
+    ${items.length ? `<table><tr><th>#</th><th>推测类型</th><th>依据</th></tr>${
+      items.slice(0,30).map(it=>`<tr><td>#${it.memory_id ?? it.id}</td>
+        <td>${esc(it.memory_type||'')}</td>
+        <td style="font-size:12px;color:var(--muted)">${esc((it.reasons||[]).join('；'))}</td></tr>`).join('')
+    }</table>` : '<div class="empty">没有需要补类型的记忆</div>'}`;
+};
+
+// ---------------- 任务续跑 ----------------
+// next_step / plan 项是对象（{step, title, status}），不是字符串。
+// 直接塞进模板会渲染成 "[object Object]"；这里统一取一步的文字。
+function stepText(st){
+  if(!st) return '';
+  if(typeof st === 'string') return st;
+  return st.title || st.step_text || (st.step != null ? `第 ${st.step} 步` : '');
+}
+
+$('#stuckGo').onclick = async ()=>{
+  const j = await api('/api/task-resume/stuck?stuck_hours=24');
+  if(!j.ok){ $('#resumeOut').innerHTML = `<div class="empty">${esc(j.message||'失败')}</div>`; return; }
+  const d = j.data || {};
+  const rows = d.tasks || [];
+  $('#resumeOut').innerHTML = `
+    <div class="hint" style="margin-bottom:8px">
+      扫了 ${d.scanned||0} 个任务，超过 ${d.stuck_hours||24} 小时没动静的有 ${d.count||0} 个。
+      只是清单 —— 系统不会替你重试。
+    </div>
+    ${rows.length ? `<table><tr><th>#</th><th>标题</th><th>状态</th><th>阶段</th><th>停了多久</th><th>下一步</th></tr>${
+      rows.map(t=>`<tr>
+        <td>#${t.task_id ?? t.id}</td>
+        <td>${esc(t.title||'')}</td>
+        <td>${esc(t.status||'')}</td>
+        <td>${t.recorded_stage ?? '—'}</td>
+        <td>${t.age_hours!=null ? t.age_hours.toFixed(1)+' 小时' : '—'}</td>
+        <td style="font-size:12px;color:var(--muted)">${esc(t.next_step||'—')}</td></tr>`).join('')
+    }</table>` : '<div class="empty">没有卡住的任务</div>'}`;
+};
+
+$('#resumeGo').onclick = async ()=>{
+  const id = ($('#resumeId').value || '').trim();
+  if(!id){ toast('先填任务 id', 'err'); return; }
+  const j = await api(`/api/task-resume/${encodeURIComponent(id)}/packet`);
+  if(!j.ok){ $('#resumeOut').innerHTML = `<div class="empty">${esc(j.message||'失败')}</div>`; return; }
+  const d = j.data || {};
+  const plan = d.plan || [];
+  const hasCtx = d.context_available === true;
+  $('#resumeOut').innerHTML = `
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:6px">#${d.task_id ?? id} ${esc(d.title||'')}</div>
+      <div style="color:var(--muted);font-size:12px;margin-bottom:8px">
+        状态 ${esc(d.status||'')} · 记录阶段 ${d.recorded_stage ?? '—'} ·
+        停了 ${d.age_hours!=null ? d.age_hours.toFixed(1)+' 小时' : '—'}
+      </div>
+      <div class="pill" style="background:${hasCtx?'var(--pill-ok-bg,#1f3d2b)':'var(--pill-warn-bg,#3d3520)'}">
+        ${hasCtx ? `带到了快照上下文（${esc(d.last_stage||'')}）` : '没有快照上下文 —— 只能恢复任务骨架'}
+      </div>
+      ${hasCtx && d.last_summary ? `<div style="margin-top:10px;font-size:13px">
+        <b>上次总结：</b>${esc(d.last_summary)}</div>` : ''}
+      <div style="margin-top:10px"><b>下一步：</b>${esc(stepText(d.next_step)) || '（计划里没有待办步骤）'}</div>
+      ${plan.length ? `<ul style="margin:8px 0 0 18px;font-size:13px">${plan.map(st=>{
+        const done = st.status === 'done' || st.status === 'completed' || st.done === true;
+        return `<li style="${done?'color:var(--muted);opacity:.7':''}">${done?'✓':'○'} ${esc(stepText(st))}</li>`;
+      }).join('')}</ul>` : ''}
+    </div>`;
+};
+
 $('#distFind').onclick = async ()=>{
   const sim = encodeURIComponent($('#distSim').value || '0.52');
   const j = await api(`/api/distillations/candidates?similarity=${sim}`);
