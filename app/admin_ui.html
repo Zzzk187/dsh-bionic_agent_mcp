@@ -126,6 +126,7 @@
   <button class="tab" data-tab="starmap">星图</button>
   <button class="tab" data-tab="tasks">任务</button>
   <button class="tab" data-tab="governance">治理</button>
+  <button class="tab" data-tab="safety">快照与提炼</button>
 </div>
 
 <!-- ========== 记忆 ========== -->
@@ -215,6 +216,42 @@
     <button class="ghost" id="govRefresh">刷新</button>
   </div>
   <div id="govOut"></div>
+</div>
+
+<!-- ========== 快照与提炼 ========== -->
+<div class="view" id="safety">
+  <div class="toolbar">
+    <button id="snapCreate">立即快照</button>
+    <button class="ghost" id="snapRefresh">刷新</button>
+    <button class="ghost" id="snapPrune">只留最近 10 份</button>
+    <span id="snapVec" class="pill"></span>
+  </div>
+  <div class="hint" style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.6">
+    快照是整库的逻辑备份，恢复前会自动先给当前状态拍一张 —— 所以恢复本身也可逆。
+    恢复后向量不会自动重建，如果这里提示缺向量，去「治理」页点一次预热。
+  </div>
+  <div id="snapList"></div>
+
+  <h3 style="margin-top:22px">分档保护分布</h3>
+  <div class="hint" style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.6">
+    分档只用来<b>收紧</b>自动操作，绝不会把记忆升级成自动动作。critical / high 的记忆
+    不会被自动归档或自动合并。
+  </div>
+  <div id="protOut"></div>
+
+  <h3 style="margin-top:22px">记忆提炼</h3>
+  <div class="hint" style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.6">
+    这里只找「哪些经历值得提炼」，<b>不生成结论</b> —— 规则写不出抽象结论，硬编只会把
+    某条原句复制成新记忆。结论由你（或调用 MCP 的模型）撰写后提交，系统会用
+    derived_from 挂回每条来源。
+  </div>
+  <div class="toolbar">
+    <button id="distFind">找出可提炼的簇</button>
+    <button class="ghost" id="distList">已提炼的</button>
+    <input id="distSim" type="number" step="0.02" min="0.3" max="0.9" value="0.52"
+           style="width:80px" title="簇内相似度阈值" />
+  </div>
+  <div id="distOut"></div>
 </div>
 
 <!-- 编辑/新建 记忆 Modal -->
@@ -457,6 +494,7 @@ $$('.tab').forEach(t=>t.onclick=()=>{
   if(t.dataset.tab==='starmap') loadStarMap();
   if(t.dataset.tab==='tasks') loadTasks();
   if(t.dataset.tab==='governance') loadGovStatus();
+  if(t.dataset.tab==='safety') loadSafety();
 });
 
 /* ---------- 记忆星图 ---------- *
@@ -1259,6 +1297,129 @@ async function loadGovStatus(){
   }
 }
 $('#govRefresh').onclick = loadGovStatus;
+
+/* ---------- 快照与提炼 ---------- */
+async function loadSafety(){
+  loadSnapshots(); loadProtection(); loadDistillations();
+}
+async function loadSnapshots(){
+  const j = await api('/api/snapshots?limit=20');
+  const rows = (j.data?.snapshots || []);
+  $('#snapList').innerHTML = rows.length
+    ? `<table><tr><th>#</th><th>标签</th><th>时间</th><th>行数</th><th>大小</th><th>操作</th></tr>${
+        rows.map(s=>`<tr>
+          <td>#${s.id}</td>
+          <td>${esc(s.label||'(未命名)')}</td>
+          <td>${esc((s.created_at||'').slice(0,19))}</td>
+          <td>${s.total_rows ?? '-'}</td>
+          <td>${s.payload_bytes!=null?(s.payload_bytes/1024).toFixed(1)+' KB':'-'}</td>
+          <td><button class="ghost" data-snap="${s.id}" style="font-size:12px">恢复</button></td>
+        </tr>`).join('')}</table>`
+    : '<div class="empty">还没有快照</div>';
+  $$('#snapList [data-snap]').forEach(b=>b.onclick=()=>restoreSnapshot(+b.dataset.snap));
+
+  const v = await api('/api/snapshots/vector-check');
+  if(v.ok){
+    const d = v.data || {};
+    const bad = d.needs_reindex;
+    $('#snapVec').textContent = bad
+      ? `向量需重建（缺 ${d.missing_vectors||0}）`
+      : '向量一致';
+    $('#snapVec').className = 'pill'+(bad?' warn':'');
+  }
+}
+async function restoreSnapshot(id){
+  if(!confirm(`确定把整库恢复到快照 #${id}？\n\n当前状态会先自动存成一份 pre-restore 快照，所以反悔还能回来。`)) return;
+  const j = await api(`/api/snapshots/${id}/restore`, {method:'POST', body:JSON.stringify({note:'admin-ui 手动恢复'})});
+  toast(j.ok ? '已恢复' : (j.message||'恢复失败'), j.ok?'ok':'err');
+  loadSnapshots(); loadStats();
+}
+$('#snapCreate').onclick = async ()=>{
+  const label = prompt('给这份快照起个名字（可留空）', '手动快照');
+  if(label===null) return;
+  const j = await api('/api/snapshots', {method:'POST', body:JSON.stringify({label, note:'admin-ui'})});
+  toast(j.ok?'快照已创建':'创建失败', j.ok?'ok':'err');
+  loadSnapshots();
+};
+$('#snapRefresh').onclick = loadSnapshots;
+$('#snapPrune').onclick = async ()=>{
+  const j = await api('/api/snapshots/prune', {method:'POST', body:JSON.stringify({keep:10})});
+  const n = (j.data?.removed || []).length;
+  toast(j.ok?`已清理 ${n} 份旧快照`:'清理失败', j.ok?'ok':'err');
+  loadSnapshots();
+};
+
+async function loadProtection(){
+  const j = await api('/api/protection');
+  if(!j.ok){ $('#protOut').innerHTML = `<div class="empty">${esc(j.message||'读取失败')}</div>`; return; }
+  const d = j.data || {};
+  const counts = d.counts || {};
+  const label = {critical:'Critical（绝不自动动）', high:'High（不自动归档/合并）',
+                 normal:'Normal', low:'Low（临时类）'};
+  $('#protOut').innerHTML = `<div class="toolbar" style="gap:10px">${
+    Object.keys(label).map(k=>`<span class="pill">${label[k]}：<b>${counts[k]||0}</b></span>`).join('')
+  }</div><div class="hint" style="color:var(--muted);font-size:12px;margin-top:8px">
+    共 ${d.total||0} 条。阈值：importance ≥ ${d.thresholds?.critical} 进 critical，
+    ≥ ${d.thresholds?.high} 进 high，≥ ${d.thresholds?.normal} 进 normal。
+  </div>`;
+}
+
+async function loadDistillations(){
+  const j = await api('/api/distillations?limit=50');
+  const rows = j.data?.distillations || [];
+  const drifted = j.data?.drifted || [];
+  const driftIds = new Set(drifted.map(d=>d.distilled_memory_id));
+  $('#distOut').innerHTML = rows.length
+    ? `<table><tr><th>#</th><th>结论</th><th>分类</th><th>来源数</th><th>状态</th></tr>${
+        rows.map(r=>`<tr>
+          <td>#${r.memory_id}</td>
+          <td>${esc((r.content||'').slice(0,120))}</td>
+          <td>${esc(r.category||'')}</td>
+          <td>${r.source_count ?? 0}</td>
+          <td>${driftIds.has(r.memory_id)
+            ? '<span style="color:var(--danger,#d9534f)">已被反驳</span>'
+            : '同向'}</td>
+        </tr>`).join('')}</table>`
+    : '<div class="empty">还没有提炼结果</div>';
+}
+
+$('#distList').onclick = loadDistillations;
+$('#distFind').onclick = async ()=>{
+  const sim = encodeURIComponent($('#distSim').value || '0.52');
+  const j = await api(`/api/distillations/candidates?similarity=${sim}`);
+  if(!j.ok){ $('#distOut').innerHTML = `<div class="empty">${esc(j.message||'失败')}</div>`; return; }
+  const d = j.data || {};
+  const cands = d.candidates || [];
+  if(!cands.length){
+    $('#distOut').innerHTML = `<div class="empty">没有值得提炼的簇（扫了 ${d.total_clusters||0} 个簇，
+      已覆盖 ${d.skipped_already_covered||0} 个）。把阈值调低会放宽标准 —— 但簇太松就失去意义了。</div>`;
+    return;
+  }
+  $('#distOut').innerHTML = cands.map((c, i)=>{
+    const ids = c.source_memory_ids || [];
+    return `<div class="card" style="margin-bottom:12px">
+      <div style="font-weight:600;margin-bottom:6px">簇 ${i+1} · ${ids.length} 条经历</div>
+      <div style="color:var(--muted);font-size:12px;margin-bottom:8px">${esc(c.why||'')}</div>
+      <ul style="margin:0 0 10px 18px">${(c.member_preview||[]).map(m=>
+        `<li>#${m.id} ${esc((m.content||'').slice(0,90))}</li>`).join('')}</ul>
+      <textarea id="distText_${i}" rows="2" placeholder="写下这几条的共同点（一句话即可，别复述原句）"></textarea>
+      <div class="row" style="margin-top:8px">
+        <button data-dist="${i}" style="font-size:12px">提交提炼</button>
+      </div>
+    </div>`;
+  }).join('');
+  $$('#distOut [data-dist]').forEach(b=>b.onclick=async ()=>{
+    const i = +b.dataset.dist;
+    const text = ($('#distText_'+i)?.value || '').trim();
+    if(!text){ toast('先写下结论', 'err'); return; }
+    const j2 = await api('/api/distillations', {method:'POST', body:JSON.stringify({
+      content: text, source_memory_ids: cands[i].source_memory_ids, category:'reflection'
+    })});
+    toast(j2.ok?'已记录提炼':'失败', j2.ok?'ok':'err');
+    if(j2.ok) loadDistillations();
+  });
+};
+
 $('#govWarmup').onclick = async ()=>{ const j=await api('/api/embedding/warmup',{method:'POST'}); toast(j.ok?'已触发预热':'失败', j.ok?'ok':'err'); setTimeout(loadGovStatus,1500); };
 $('#govScore').onclick = async ()=>{
   const j=await api(`/api/governance/score?category=${encodeURIComponent($('#govCategory').value)}&limit=50`);

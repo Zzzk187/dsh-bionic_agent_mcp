@@ -35,6 +35,11 @@ import app.mcp_server as core  # noqa: E402
 from app import governance_service as gov  # noqa: E402
 from app import memory_lifecycle as life  # noqa: E402
 from app import embeddings as emb  # noqa: E402
+from app import snapshots as snap  # noqa: E402
+from app import protection as protect  # noqa: E402
+from app import distillation as distill  # noqa: E402
+from app import feedback_loop as feedback  # noqa: E402
+from app.db import rowdict as db_rowdict  # noqa: E402
 
 HTML_PATH = Path(__file__).resolve().with_name("admin_ui.html")
 
@@ -398,6 +403,111 @@ def api_consolidation(status: str = Query(""), limit: int = Query(50, ge=1, le=2
 def api_duplicates(category: str = Query(""), candidate_count: int = Query(8, ge=1, le=50)):
     # find_duplicate_memories(memory_ids, category, candidate_count)
     return _run(life.find_duplicate_memories, None, category, candidate_count)
+
+
+# ---------------------------------------------------------------------------
+# 快照（整库备份 / 回滚）
+# ---------------------------------------------------------------------------
+@app.get("/api/snapshots")
+def api_snapshots(limit: int = Query(20, ge=1, le=200)):
+    return _run(snap.list_snapshots, limit)
+
+
+@app.post("/api/snapshots")
+def api_snapshot_create(payload: dict):
+    return _run(snap.create_snapshot, payload.get("label", "") or "",
+                "manual", payload.get("note", "") or "")
+
+
+@app.post("/api/snapshots/{snapshot_id}/restore")
+def api_snapshot_restore(snapshot_id: int, payload: dict):
+    return _run(snap.restore_snapshot, snapshot_id, payload.get("note", "") or "")
+
+
+@app.post("/api/snapshots/prune")
+def api_snapshot_prune(payload: dict):
+    return _run(snap.prune_snapshots, int(payload.get("keep", 10)))
+
+
+@app.get("/api/snapshots/vector-check")
+def api_snapshot_vector_check():
+    return _run(snap.check_vector_consistency_after_restore)
+
+
+# ---------------------------------------------------------------------------
+# 分档保护
+# ---------------------------------------------------------------------------
+@app.get("/api/protection")
+def api_protection_summary(category: str = Query(""),
+                           include_archived: bool = Query(False)):
+    from app.db import connect
+    sql = "SELECT * FROM memories WHERE 1=1"
+    args: list = []
+    if category.strip():
+        sql += " AND category=?"
+        args.append(category.strip())
+    if not include_archived:
+        sql += " AND status='active'"
+    with connect() as conn:
+        rows = [db_rowdict(r) for r in conn.execute(sql, args).fetchall()]
+    return _ok(protect.summarize(rows))
+
+
+@app.get("/api/protection/{memory_id}")
+def api_protection_one(memory_id: int):
+    from app.db import connect
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+    if row is None:
+        return _err(f"记忆 #{memory_id} 不存在", status=404)
+    return _ok(protect.assess(db_rowdict(row)))
+
+
+# ---------------------------------------------------------------------------
+# 反馈闭环
+# ---------------------------------------------------------------------------
+@app.get("/api/feedback")
+def api_feedback_summary(limit: int = Query(20, ge=1, le=200)):
+    return _run(feedback.summarize_feedback, limit)
+
+
+@app.post("/api/feedback/recall")
+def api_feedback_recall(payload: dict):
+    ids = payload.get("memory_ids") or []
+    if not isinstance(ids, list):
+        return _err("memory_ids 必须是数组")
+    return _run(feedback.record_retrieved, [int(x) for x in ids])
+
+
+# ---------------------------------------------------------------------------
+# 记忆提炼
+# ---------------------------------------------------------------------------
+@app.get("/api/distillations")
+def api_distillations(limit: int = Query(50, ge=1, le=200)):
+    return _run(distill.list_distillations, limit)
+
+
+@app.get("/api/distillations/candidates")
+def api_distill_candidates(limit: int = Query(20, ge=1, le=100),
+                           category: str = Query(""),
+                           similarity: float = Query(0.52, ge=0, le=1),
+                           include_covered: bool = Query(False)):
+    return _run(distill.find_distillation_candidates, limit, category,
+                similarity, include_covered)
+
+
+@app.post("/api/distillations")
+def api_distill_apply(payload: dict):
+    ids = payload.get("source_memory_ids") or []
+    if not isinstance(ids, list) or not ids:
+        return _err("source_memory_ids 必须是非空数组")
+    return _run(distill.apply_distillation,
+                payload.get("content", "") or "",
+                [int(x) for x in ids],
+                payload.get("category", "reflection") or "reflection",
+                float(payload.get("confidence", 0.7)),
+                payload.get("note", "") or "")
+
 
 
 # ---------------------------------------------------------------------------
