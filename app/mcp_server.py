@@ -18,6 +18,8 @@ from app import governance_service as gov
 from app import governance_maintenance as maint
 from app import memory_lifecycle as life
 from app import feedback_loop
+from app import snapshots
+from app import protection
 from app import activation_spreading as spreading
 
 # Two FastMCP instances share the same process/module state but are launched as
@@ -711,6 +713,89 @@ def rollback_governance_action(action_id: int, reason: str = "") -> dict:
     except (TypeError, ValueError):
         return {"ok": False, "message": "action_id must be an integer"}
     return gov.rollback_governance_action(action_id, reason=str(reason or ""))
+
+
+@mcp_gov.tool()
+def create_db_snapshot(label: str = "", note: str = "", actor: str = "user") -> dict:
+    """整库快照：把所有表 dump 成文件 + 在 db_snapshots 记元数据（含 sha256）。
+
+    单个治理动作有 rollback，但一次批量维护/误跑的爆炸半径往往超出单动作能
+    回滚的范围。动批量操作之前先拍一张，出事时整个库回到那一刻。
+    """
+    _ensure_db()
+    return snapshots.create_snapshot(label=str(label or ""), kind="manual",
+                                     actor=str(actor or "user"), note=str(note or ""))
+
+
+@mcp_gov.tool()
+def list_db_snapshots(limit: int = 20) -> dict:
+    """列出可用快照（含文件是否还在、各表行数）。"""
+    _ensure_db()
+    return snapshots.list_snapshots(limit=limit)
+
+
+@mcp_gov.tool()
+def restore_db_snapshot(snapshot_id: int, note: str = "", actor: str = "user") -> dict:
+    """把整个库恢复到某个快照（单事务，全成或全不成）。
+
+    恢复前会自动给当前状态再拍一张（pre-restore），所以这一步本身也可逆。
+    恢复后不自动重建向量，只报告 vector_check.需要重建。
+    """
+    _ensure_db()
+    try:
+        snapshot_id = int(snapshot_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "message": "snapshot_id must be an integer"}
+    return snapshots.restore_snapshot(snapshot_id, actor=str(actor or "user"),
+                                      note=str(note or ""))
+
+
+@mcp_gov.tool()
+def check_vector_consistency() -> dict:
+    """检查向量索引与内容一致性；needs_reindex=True 表示恢复/编辑后该重建。"""
+    _ensure_db()
+    return snapshots.check_vector_consistency_after_restore()
+
+
+@mcp_gov.tool()
+def prune_db_snapshots(keep: int = 10) -> dict:
+    """只保留最近 N 个快照，更早的连同文件一起删。"""
+    _ensure_db()
+    return snapshots.prune_snapshots(keep=keep)
+
+
+@mcp_gov.tool()
+def assess_memory_protection(memory_id: int) -> dict:
+    """某条记忆的保护分档（critical/high/normal/low）及被禁止的自动动作。"""
+    _ensure_db()
+    try:
+        memory_id = int(memory_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "message": "memory_id must be an integer"}
+    with connect() as conn:
+        row = rowdict(conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone())
+    if not row:
+        return {"ok": False, "message": "Memory not found", "memory_id": memory_id}
+    verdict = protection.assess(row)
+    verdict.update({"ok": True, "memory_id": memory_id,
+                    "content": (row.get("content") or "")[:120]})
+    return verdict
+
+
+@mcp_gov.tool()
+def summarize_protection(category: str = "", include_archived: bool = False) -> dict:
+    """整库保护分档分布（几条 critical、几条会被自动归档）。"""
+    _ensure_db()
+    sql = "SELECT * FROM memories WHERE 1=1"
+    args: list = []
+    if category.strip():
+        sql += " AND category=?"
+        args.append(category.strip())
+    if not include_archived:
+        sql += " AND status='active'"
+    with connect() as conn:
+        rows = [rowdict(r) for r in conn.execute(sql, args).fetchall()]
+    return protection.summarize(rows)
 
 
 @mcp_gov.tool()

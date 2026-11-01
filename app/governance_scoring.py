@@ -19,6 +19,8 @@ from app.governance_rules import load_rules
 # The module does not touch the database at import time, so this file stays
 # DB-free and `score_memories(dry_run=True)` still has no side effects.
 from app import feedback_loop as feedback
+# protection is likewise pure (no DB access at import or in assess()).
+from app import protection
 
 GOV_ACTIVE_DEFAULT = "active"
 GOV_STATUS_PENDING_REVIEW = "pending_review"
@@ -358,6 +360,17 @@ def archive_candidate(memory: dict, scores: dict, rules: dict | None = None) -> 
     reasons: list[str] = []
     if memory.get("protected") in (1, True, "1", "true"):
         reasons.append("记忆受保护（protected=1），永不进入自动归档候选")
+        return False, reasons
+    # Graduated tiers: a critical/high memory must not reach the low-score path
+    # just because its freshness decayed. `protected` alone left everything else
+    # exposed to one shared threshold, so a stated preference and a scratch note
+    # were equally archivable.
+    tier_verdict = protection.assess(memory, scores, rules)
+    if tier_verdict["blocks"].get("auto_archive"):
+        reasons.append(
+            f"保护分档为 {tier_verdict['tier']}，禁止自动归档"
+            f"（重要性 {tier_verdict['importance']:.1f}，"
+            f"{'；'.join(r for r in tier_verdict['reasons'][:4])}）")
         return False, reasons
     if str(memory.get("memory_status") or GOV_ACTIVE_DEFAULT) == GOV_STATUS_PENDING_REVIEW:
         reasons.append("记忆处于待审核状态，需先人工裁决")

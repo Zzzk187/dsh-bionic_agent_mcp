@@ -24,6 +24,7 @@ from typing import Optional
 from app import db
 from app.embeddings import EmbeddingUnavailable
 from app import feedback_loop
+from app import protection
 from app import governance_service as gov
 from app import governance_rules as rules
 from app import governance_scoring as scoring
@@ -692,13 +693,32 @@ def consolidate_memory_candidates(persist: bool = False, limit: int = 50,
         det = gov.detect_conflicts(category=category, candidate_count=rule.get("candidate_count", 8),
                                    persist=False)
         findings = det.get("findings", []) if isinstance(det, dict) else det
+        # A single protection verdict per row, reused by every heuristic below.
+        # Recomputed here (rather than trusting the stored `protected` flag)
+        # because the tiers are derived from scores, which move over time.
+        def _tier(d):
+            return protection.assess(d, {"importance": float(d.get("importance_score") or 0.0)})
+
         for f in findings:
             if f.get("conflict_type") in ("duplicate", "correction"):
+                pair_ids = [f.get("memory_id"), f.get("candidate_memory_id")]
+                if any(_tier(next((r for r in rows if r["id"] == pid), {}))["blocks"]["auto_merge"]
+                       for pid in pair_ids if pid is not None):
+                    candidates.append({
+                        "kind": "merge_needs_review",
+                        "title": f"合并需人工确认 {pair_ids[0]} / {pair_ids[1]}",
+                        "detail": (f.get("reason", "") +
+                                   "（涉及受保护/高分记忆，自动合并会绕过保护，改为人工裁决）"),
+                        "source_memory_ids": pair_ids,
+                        "confidence": f.get("confidence", 0.0),
+                        "rule_version": f.get("rule_version", rule["rule_version"]),
+                    })
+                    continue
                 candidates.append({
                     "kind": "merge_duplicate",
                     "title": f"合并重复记忆 {f.get('memory_id')} / {f.get('candidate_memory_id')}",
                     "detail": f.get("reason", ""),
-                    "source_memory_ids": [f.get("memory_id"), f.get("candidate_memory_id")],
+                    "source_memory_ids": pair_ids,
                     "confidence": f.get("confidence", 0.0),
                     "rule_version": f.get("rule_version", rule["rule_version"]),
                 })
@@ -720,20 +740,26 @@ def consolidate_memory_candidates(persist: bool = False, limit: int = 50,
             acc = int(d.get("access_count") or 0)
             src = (d.get("source") or "").lower()
             protected = int(d.get("protected") or 0)
-            # archive review (never for protected / preference)
+            tier = _tier(d)
+            tier_blocks = tier["blocks"]
+            # archive review (never for protected / preference / protected tiers)
             is_pref = mtype == "preference"
-            if (not protected and not is_pref and imp <= rule["archive_importance_threshold"]
+            if (not protected and not is_pref and not tier_blocks["auto_archive"]
+                    and imp <= rule["archive_importance_threshold"]
                     and fr <= rule["archive_freshness_threshold"]):
                 candidates.append({
                     "kind": "archive_review",
                     "title": f"归档候选 {mid}",
-                    "detail": f"importance={imp} freshness={fr}",
+                    "detail": f"importance={imp} freshness={fr} tier={tier['tier']}",
                     "source_memory_ids": [mid],
                     "confidence": 0.5,
                     "rule_version": rule["rule_version"],
                 })
-            # stale fact (low freshness, low access, not protected)
-            if not protected and fr <= rule["archive_freshness_threshold"] and acc == 0:
+            # stale fact (low freshness, low access, not protected, not a
+            # protected tier — a critical memory that merely went stale is a
+            # reason to revisit it, not a reason to call the fact wrong)
+            if (not protected and not tier_blocks["auto_archive"]
+                    and fr <= rule["archive_freshness_threshold"] and acc == 0):
                 candidates.append({
                     "kind": "stale_fact",
                     "title": f"可能过时事实 {mid}",
