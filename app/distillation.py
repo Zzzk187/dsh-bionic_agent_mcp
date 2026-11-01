@@ -59,11 +59,73 @@ def _vectors(conn) -> dict[int, list[float]]:
     return out
 
 
+def _pair_sim(vectors, a, b) -> float:
+    try:
+        return cosine_similarity(vectors[a], vectors[b])
+    except Exception:
+        return -1.0
+
+
+def _split_until_compact(group: list[int], vectors: dict[int, list[float]],
+                         threshold: float) -> list[list[int]]:
+    """Split a union-find group until every pair inside is >= threshold.
+
+    Union-find alone is single-linkage: A~B and B~C merge A and C even when
+    they are unrelated. On the live library that produced one 28-node cluster
+    whose weakest internal pair scored -0.019 — a "theme" that spanned 授权,
+    教训, 环境 and 项目, i.e. not a theme at all.
+
+    The fix is a compactness requirement: repeatedly split at the the weakest
+    link. That is strict single-linkage correction — each cluster ends up
+    where *every* member is similar to *every* other, which is what "several
+    experiences of the same thing" actually means. O(n^3) worst case, but n
+    here is dozens of active memories, not millions.
+    """
+    if len(group) < 2:
+        return []
+    for i, a in enumerate(group):
+        for b in group[i + 1:]:
+            if _pair_sim(vectors, a, b) < threshold:
+                break
+        else:
+            continue
+        break
+    else:
+        return [group] if len(group) >= MIN_CLUSTER_SIZE else []
+
+    # Weakest link: split around the two least similar members by seeding two
+    # sides and assigning the rest to whichever side it resembles more.
+    worst, pair = 2.0, (group[0], group[1])
+    for i, a in enumerate(group):
+        for b in group[i + 1:]:
+            s = _pair_sim(vectors, a, b)
+            if s < worst:
+                worst, pair = s, (a, b)
+    left_seed, right_seed = pair
+    left, right = [left_seed], [right_seed]
+    for node in group:
+        if node in (left_seed, right_seed):
+            continue
+        if _pair_sim(vectors, node, left_seed) >= _pair_sim(vectors, node, right_seed):
+            left.append(node)
+        else:
+            right.append(node)
+    out = []
+    for part in (left, right):
+        if len(part) >= MIN_CLUSTER_SIZE:
+            out.extend(_split_until_compact(part, vectors, threshold))
+    return out
+
+
 def _cluster(rows: list[dict], vectors: dict[int, list[float]],
              threshold: float) -> list[list[int]]:
-    """Union-find over cosine similarity. Deliberately plain: a fancier
-    clustering would change *which* evidence gets grouped, and that decision
-    should be inspectable rather than an opaque optimisation."""
+    """Union-find over cosine similarity, then enforce pairwise compactness.
+
+    Union-find stays because it is inspectable — a fancier clustering would
+    change *which* evidence gets grouped in ways nobody can audit. But raw
+    union-find is single-linkage and chains, so each group is then split until
+    every内部 pair really is >= threshold.
+    """
     ids = [r["id"] for r in rows if r["id"] in vectors]
     parent = {i: i for i in ids}
 
@@ -85,7 +147,11 @@ def _cluster(rows: list[dict], vectors: dict[int, list[float]],
     groups: dict[int, list[int]] = {}
     for i in ids:
         groups.setdefault(find(i), []).append(i)
-    return sorted(groups.values(), key=len, reverse=True)
+
+    compact: list[list[int]] = []
+    for group in groups.values():
+        compact.extend(_split_until_compact(group, vectors, threshold))
+    return sorted(compact, key=len, reverse=True)
 
 
 def _already_distilled(conn) -> set[int]:
@@ -152,7 +218,8 @@ def find_distillation_candidates(limit: int = 20, category: str = "",
             "size": len(members),
             "categories": [c for c in cats if c],
             "similarity_threshold": threshold,
-            "why": (f"{len(members)} 条记忆两两语义相似度 ≥ {threshold:.2f}，"
+            "why": (f"{len(members)} 条记忆 **两两** 语义相似度都 ≥ {threshold:.2f}"
+                    "（已排除 A~B~C 但 A 与 C 无关的链式串联），"
                     "构成同一主题下的多次具体经历；适合概括成一条抽象结论"),
             "how_to_apply": ("把成员里的共同点写成一条抽象记忆，用 "
                              "apply_distillation(content=..., source_memory_ids=[...]) 提交；"

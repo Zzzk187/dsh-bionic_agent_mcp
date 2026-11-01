@@ -197,9 +197,64 @@ def test_real_library():
           (res.get("note") or "")[:40])
 
 
+def test_chain_not_merged():
+    """A~B~C 但 A 与 C 无关时，不能把三条并成一个"主题"。
+
+    这是真库上翻过的车：单链接并查集把 28 条跨四个类别的记忆串成一个簇，
+    簇内最弱一对相似度 -0.019。测试必须造出链条，只造干净簇是抓不住的。
+    """
+    print("\n=== 链式串联不能被并成一个主题 ===")
+    db.init_db()
+    # 前面几段测试种的记忆会和这条链并簇，先清干净再种自己的。
+    with db.transaction() as conn:
+        for table in ("memory_embeddings", "memory_links", "memory_feedback",
+                      "memory_conflicts", "consolidation_candidates"):
+            conn.execute(f"DELETE FROM {table}")
+        conn.execute("DELETE FROM memories")
+    # A~B 与 B~C 都过阈值，A 与 C 正交 —— 典型的一条链。
+    a = unit([1.0, 0.0, 0.0, 0.0])
+    b = unit([1.0, 1.0, 0.0, 0.0])
+    c = unit([0.0, 1.0, 0.0, 0.0])
+    # 再给一条真正紧密的三连，用来确认修复没有把正常簇也拆散。
+    tight = [unit([0.0, 0.0, 1.0, 0.1]), unit([0.0, 0.0, 1.0, 0.12]),
+             unit([0.0, 0.0, 1.0, 0.08])]
+    ids = seed_with_vectors([
+        ("链条头：布局要留白", "教训", a),
+        ("链条中：界面别太挤", "项目", b),
+        ("链条尾：显卡 24G 显存", "环境", c),
+        ("交付物一律中文", "preference", tight[0]),
+        ("文档也用中文写", "preference", tight[1]),
+        ("注释优先中文", "preference", tight[2]),
+    ])
+    res = distillation.find_distillation_candidates(similarity=0.52)
+    check("扫描成功", res.get("ok"), f"候选 {res.get('count')} 个")
+    check("链条没有被并成一个候选", res.get("count") == 1,
+          f"count={res.get('count')}（期望只有那个紧密三连）")
+    cands = res.get("candidates") or []
+    got = sorted(cands[0].get("source_memory_ids") or []) if cands else []
+    check("唯一候选就是那三条紧密记忆", got == sorted(ids[3:]),
+          f"{got} vs {sorted(ids[3:])}")
+    check("链条上的三条没有被塞进候选",
+          not any(i in got for i in ids[:3]),
+          f"链条成员 {ids[:3]} 未出现在 {got}")
+
+    # 直接验证不变量：任何返回的簇，内部每对都必须达标。
+    with db.connect() as conn:
+        vectors = distillation._vectors(conn)
+    groups = distillation._cluster(
+        [{"id": i} for i in ids], vectors, 0.52)
+    worst = 1.0
+    for g in groups:
+        for i, x in enumerate(g):
+            for y in g[i + 1:]:
+                worst = min(worst, distillation._pair_sim(vectors, x, y))
+    check("所有簇内部两两都达标", worst >= 0.52, f"簇内最小相似度 {worst:.3f}")
+
+
 def run():
     test_cluster_found()
     test_min_size_enforced()
+    test_chain_not_merged()
     test_apply_and_provenance()
     test_already_covered()
     test_contradiction_surfaced()
