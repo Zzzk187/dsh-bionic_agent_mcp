@@ -65,14 +65,17 @@ print(json.dumps({{"ok": ok}}))
 """
 
 # Holder keeps a write transaction open for `hold` seconds, then rolls back.
+# It writes `ready_file` only AFTER the write lock is actually held, so the test
+# never has to guess how long importing + init_db() takes.
 _HOLDER = """
-import sqlite3, sys, time
+import sqlite3, sys, time, pathlib
 sys.path.insert(0, r"{root}")
 from app import db
 db.init_db()
 conn = sqlite3.connect(db.DB_PATH, timeout=30)
 conn.execute("BEGIN IMMEDIATE")
 conn.execute("INSERT INTO memories(content, category) VALUES('holder','test')")
+pathlib.Path(r"{ready_file}").write_text("locked", encoding="utf-8")
 time.sleep({hold})
 conn.rollback()
 conn.close()
@@ -225,11 +228,26 @@ def test_busy_timeout_actually_waits() -> None:
             return
 
         hold_seconds = 3
+        ready_file = Path(td) / "lock-ready"
         holder = subprocess.Popen(
-            [sys.executable, "-c", _HOLDER.format(root=PROJECT_ROOT, hold=hold_seconds)],
+            [sys.executable, "-c", _HOLDER.format(
+                root=PROJECT_ROOT, hold=hold_seconds, ready_file=ready_file)],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        time.sleep(1.0)  # let the holder take the lock first
+        # Wait for the holder to actually own the lock. A fixed sleep is a
+        # timing assumption: under load the holder can still be importing while
+        # the waiter races ahead and finishes instantly, failing the test on
+        # correct code. 30s cap so a broken holder cannot hang the suite.
+        deadline = time.time() + 30
+        while time.time() < deadline and not ready_file.exists():
+            if holder.poll() is not None:
+                break
+            time.sleep(0.05)
+        if not ready_file.exists():
+            holder.communicate(timeout=30)
+            check("持锁等待测试前置：holder 真拿到写锁", False,
+                  "holder 未能在 30s 内取得写锁（它已经退出或卡住）")
+            return
         t0 = time.time()
         rc_w, out_w, err_w = run_worker(
             _WAITER.format(root=PROJECT_ROOT), env, timeout=120)

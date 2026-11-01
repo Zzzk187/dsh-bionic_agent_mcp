@@ -79,6 +79,36 @@ def _tags_of(row: dict) -> set[str]:
     return set()
 
 
+_NUMBER = re.compile(r"\d+(?:\.\d+)?")
+
+
+def extract_values(text: str) -> list[str]:
+    """Numeric values mentioned in the text, in order, de-duplicated.
+
+    Versions like "0.2.1-rc.3" yield 0.2.1 and 3; that is fine for this rule,
+    which only asks "do the two texts state different numbers", not "which
+    number is the version".
+    """
+    seen: list[str] = []
+    for m in _NUMBER.findall(normalize_text(text)):
+        if m not in seen:
+            seen.append(m)
+    return seen
+
+
+def value_skeleton(text: str) -> str:
+    """Text with numbers replaced by a placeholder -- the 'shape' of the claim.
+
+    Two memories with the same skeleton but different values are the same
+    claim with a changed number, which is a value conflict, not a duplicate.
+    """
+    return _NUMBER.sub("#", normalize_text(text))
+
+
+def _skeleton_similarity(a: str, b: str) -> float:
+    return lexical_similarity(value_skeleton(a), value_skeleton(b))
+
+
 def classify_pair(row_a: dict, row_b: dict, similarity: float, rules: dict) -> dict | None:
     """Classify the relationship between two memories.
 
@@ -156,6 +186,28 @@ def classify_pair(row_a: dict, row_b: dict, similarity: float, rules: dict) -> d
             "keep_both", "两条都保留",
         )
 
+    # ---- same claim, different value -------------------------------------
+    # Must be checked BEFORE the duplicate branch: near-identical text with a
+    # changed number is exactly where "duplicate" does the most damage, because
+    # archiving it throws away a value that really did exist.
+    values_a = extract_values(content_a)
+    values_b = extract_values(content_b)
+    if values_a and values_b and set(values_a) != set(values_b):
+        skeleton_sim = _skeleton_similarity(content_a, content_b)
+        skeleton_min = float(rules.get("value_skeleton_min", 0.80))
+        if skeleton_sim >= skeleton_min:
+            only_a = [v for v in values_a if v not in values_b]
+            only_b = [v for v in values_b if v not in values_a]
+            return _verdict(
+                rules, "value_conflict", sim, 0.65,
+                f"除取值外表述一致（骨架相似度 {skeleton_sim:.2f}），但数值不同："
+                f"{only_a[:3]} vs {only_b[:3]}；同一事实在不同时间/环境下的取值"
+                f"应各自保留，不能当作重复处理",
+                "keep_both_time_note",
+                "两条都保留；如果其中一条是当前有效值，用 supersedes 关系标注新版本，"
+                "不要归档——被取代的取值本身也是有效历史",
+            )
+
     # ---- near identical ---------------------------------------------------
     if sim >= dup_sim:
         return _verdict(
@@ -196,4 +248,5 @@ def _verdict(rules: dict, ctype: str, similarity: float, confidence: float,
 
 def needs_review(verdict: dict) -> bool:
     """Uncertain verdicts go to the review queue instead of being applied."""
-    return verdict.get("conflict_type") in ("possible_conflict", "undetermined")
+    return verdict.get("conflict_type") in (
+        "possible_conflict", "undetermined", "value_conflict")
