@@ -117,6 +117,45 @@ def _parse_ts(value):
         return None
 
 
+def _attach_governance(rows: list[dict]) -> list[dict]:
+    """把列表结果里缺的治理字段补回来（access_count / 保护 / 三分数）。
+
+    `_memory_out` 默认剔除这些列，那是给 MCP 工具用的输出契约。面板需要
+    access_count 才能按访问热度分组 —— 拿不到时前端会静默把所有记忆当成
+    "从没翻过"，分组看起来"全在一档"，而界面不会报任何错。
+
+    不直接改 `_memory_out` 的默认行为：那是 MCP 的稳定输出，面板不该为了
+    自己的展示需要去改它。
+    """
+    if not rows:
+        return rows
+    ids = [r["id"] for r in rows if "id" in r]
+    if not ids:
+        return rows
+    from app.db import connect
+    placeholders = ",".join("?" * len(ids))
+    with connect() as conn:
+        found = conn.execute(
+            f"SELECT id, access_count, last_accessed_at, memory_status, protected, "
+            f"importance_score, confidence_score, freshness_score "
+            f"FROM memories WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+    extra = {r["id"]: dict(r) for r in found}
+    for r in rows:
+        e = extra.get(r.get("id"))
+        if not e:
+            continue
+        r["access_count"] = e.get("access_count") or 0
+        r["last_accessed_at"] = e.get("last_accessed_at")
+        r["memory_status"] = e.get("memory_status")
+        r["protected"] = bool(e.get("protected"))
+        r["importance"] = e.get("importance_score")
+        r["confidence_score"] = e.get("confidence_score")
+        r["freshness"] = e.get("freshness_score")
+    return rows
+
+
 def _ok(data):
     return JSONResponse(content={"ok": True, "data": data})
 
@@ -147,7 +186,7 @@ def api_list_memories(
     limit: int = Query(50, ge=1, le=200),
 ):
     rows = core.search_memories(q, limit, category, include_archived)
-    return _ok(rows)
+    return _ok(_attach_governance(rows))
 
 
 @app.post("/api/memories")
@@ -255,9 +294,88 @@ def api_memories_timeline(axis: str = Query("created", pattern="^(created|update
     })
 
 
+# 同样必须在 /{memory_id} 之前。
+@app.get("/api/memories/breakdown")
+def api_memories_breakdown(include_archived: bool = Query(False)):
+    """全库按分类 / 访问热度 / 时间三个维度统计。
+
+    统一走这一个接口而不是三个，是因为三个维度用的是同一批行；
+    分三次查会读到三个不同瞬间的库，数字对不上时排查成本很高。
+    """
+    from app.db import connect
+    statuses = "('active','archived')" if include_archived else "('active')"
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT id, category, access_count, last_accessed_at, created_at, "
+            f"updated_at, importance_score FROM memories "
+            f"WHERE status IN {statuses} AND memory_status != 'pending_review'"
+        ).fetchall()
+
+    total = len(rows)
+
+    # --- 分类 ---
+    cats: dict[str, dict] = {}
+    for r in rows:
+        c = (r["category"] or "general")
+        slot = cats.setdefault(c, {"key": c, "label": c, "count": 0,
+                                   "never_accessed": 0, "newest": None})
+        slot["count"] += 1
+        if not (r["access_count"] or 0):
+            slot["never_accessed"] += 1
+        day = str(r["created_at"] or "")[:10]
+        if day and (slot["newest"] is None or day > slot["newest"]):
+            slot["newest"] = day
+    by_category = sorted(cats.values(), key=lambda x: (-x["count"], x["key"]))
+
+    # --- 访问热度 ---
+    # 分档依据 access_count 的绝对值，而不是分位数：分位数在"全库都是 0"
+    # 的时候仍然会造出四档，看起来像有数据，其实全是 0。
+    buckets = [
+        ("hot",      "常翻的",   10, None),
+        ("warm",     "偶尔翻",   3,  10),
+        ("cold",     "冷门",     1,  3),
+        ("untouched", "从没翻过", 0,  1),
+    ]
+    heat = {k: {"key": k, "label": lb, "count": 0, "ids": []}
+            for k, lb, _lo, _hi in buckets}
+    for r in rows:
+        n = int(r["access_count"] or 0)
+        for k, _lb, lo, hi in buckets:
+            if n >= lo and (hi is None or n < hi):
+                heat[k]["count"] += 1
+                if len(heat[k]["ids"]) < 20:
+                    heat[k]["ids"].append(r["id"])
+                break
+    by_heat = [heat[k] for k, _lb, _lo, _hi in buckets]
+    touched = total - heat["untouched"]["count"]
+
+    return _ok({
+        "total": total,
+        "by_category": by_category,
+        "by_heat": by_heat,
+        "heat_note": (
+            "全部 %d 条都还没有访问记录 —— 访问统计是这一版才接上的，"
+            "以前的召回不会记账。这里的「从没翻过」并不代表没人关心它们。"
+            % total if touched == 0 else
+            "有访问记录的 %d 条，没有的 %d 条。" % (touched, total - touched)
+        ),
+        "touched": touched,
+    })
+
+
 @app.get("/api/memories/{memory_id}")
 def api_get_memory(memory_id: int, include_archived: bool = Query(True)):
-    return _run(core.get_memory, memory_id, include_archived)
+    """打开详情算一次真实访问；列表接口不算。
+
+    列表一屏 60 条，若列表也记，"常翻的"就等于"最近列出来的"——那个数字
+    只会反映 UI 布局。
+    """
+    data = _run(core.get_memory, memory_id, include_archived)
+    try:
+        gov.touch_access([int(memory_id)])
+    except Exception:  # noqa: BLE001 —— 记账失败不该让详情打不开
+        pass
+    return data
 
 
 @app.put("/api/memories/{memory_id}")

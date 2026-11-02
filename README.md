@@ -27,6 +27,7 @@
 | 记忆有效期 | `set_memory_expiry` / `scan_expired_memories` / `run_expiry_policy`（`save_memory(ttl_days=...)`） | 只对临时类生效；**过期只降权不删除**；默认 dry_run、送审不直接归档 |
 | 召回画像 | `backfill_memory_types`（`recall_memories` 自带） | 按记忆类型/问句形态选权重画像，结果回显画像名；只改比重不改成分 |
 | 取值冲突 | （`detect_memory_conflicts` 内置 `value_conflict`） | 同骨架不同数值判为取值矛盾，建议两条都保留，不再当重复归档 |
+| 记忆库浏览 | `/api/memories/timeline` / `/api/memories/breakdown`（面板） | 全库按天/分类/访问热度统计；访问记账走 `touch_access`（召回与详情各记一次，列表不记） |
 
 **核心实例 `bionic-agent`：21 个工具。** 日常使用只挂它即可，固定工具清单 token 成本低。
 **治理实例 `bionic-agent-governance`：45 个工具。** 需要记忆治理/整理/融合召回时再挂。
@@ -519,6 +520,8 @@ B: DSH 桌面版每次重启端口都会变，这次是 51366
 | `tests/expiry_test.py` | 有效期：临时类可设/长期类拒绝、过期降权不删除、24h 宽限、dry_run 不改数据（37 项） |
 | `tests/recall_profile_test.py` | 召回画像：权重不归零不主导、画像确实改变算分、类型乘子有界、写入自动归类（62 项） |
 | `tests/conflict_triage_test.py` | 取值冲突：同骨架不同数值不判重复、真重复仍抓得到、MCP 端到端（28 项） |
+| `tests/timeline_test.py` | 时间分档：路由不被 `/{id}` 抢先、未来时间归今天、认不出的计入 unparsed（12 项） |
+| `tests/views_test.py` | 分类/热度/时间轴：access_count 必须回填、热度按绝对值分档、召回与详情记账而列表不记（13 项） |
 
 示例用法：
 

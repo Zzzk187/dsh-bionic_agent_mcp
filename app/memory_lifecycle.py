@@ -435,6 +435,18 @@ def recall_memories(query: str = "", top_k: int = 5, category: str = "",
             related = _related_subgraph(c, ids, max_depth=1)
             for r in result:
                 r["_related"] = related.get(r["id"], [])
+        # 记一次真实访问。只加 access_count / last_accessed_at（频次分量的
+        # 原料），不改 confidence、不写反馈信号、不 rescore —— "曝光不能让
+        # 记忆升格"这条规矩不受影响。
+        #
+        # 放在拿到 result 之后：记的是"真正返回给调用方的那些"，而不是
+        # "参与打分的全部候选"。
+        if result:
+            try:
+                from app import governance_service as _gov
+                _gov.touch_access([r["id"] for r in result])
+            except Exception:  # noqa: BLE001 —— 记账失败不该让召回本身失败
+                pass
         return result
 
     if conn is not None:

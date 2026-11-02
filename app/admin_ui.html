@@ -115,6 +115,18 @@
   }
   .mem-group-title { font-weight: 600; font-size: 13px; }
   .mem-group-count { color: var(--muted); font-size: 12px; }
+  .tl-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(16px, 1fr));
+    gap: 3px; padding: 10px; border: 1px solid var(--line, #232833);
+    border-radius: 6px; background: var(--card, #171b23);
+  }
+  .tl-cell { aspect-ratio: 1; border-radius: 2px; transition: transform .1s; }
+  .tl-cell:hover { transform: scale(1.35); }
+  .tl-legend {
+    display: flex; align-items: center; gap: 6px; margin-top: 8px;
+    font-size: 11px; color: var(--muted);
+  }
+  .tl-swatch { width: 14px; height: 14px; border-radius: 2px; display: inline-block; }
 </style>
 </head>
 <body>
@@ -158,7 +170,10 @@
     </select>
     <select id="memGroupBy" title="怎么分组">
       <option value="day" selected>按天分组</option>
-      <option value="bucket">按时间段分组</option>
+      <option value="bucket">按时间段</option>
+      <option value="category">按分类</option>
+      <option value="heat">按访问热度</option>
+      <option value="timeline">时间轴</option>
       <option value="none">不分组</option>
     </select>
     <button class="ghost" id="memRefresh">刷新</button>
@@ -1212,6 +1227,145 @@ async function loadTimeline(){
   });
 }
 
+// ---------------- 按分类分组 ----------------
+const CAT_COLORS = {
+  '教训': '#f2836b', '项目': '#6fb3f2', '环境': '#6fe0b8',
+  '授权': '#f2c96f', 'preference': '#c48ef2', 'general': '#8b93a7',
+};
+function catColor(c){ return CAT_COLORS[c] || '#8b93a7'; }
+
+function renderByCategory(list, showScore){
+  const groups = new Map();
+  for(const m of list){
+    const c = m.category || 'general';
+    if(!groups.has(c)) groups.set(c, []);
+    groups.get(c).push(m);
+  }
+  const keys = [...groups.keys()].sort((a,b)=>groups.get(b).length - groups.get(a).length);
+  $('#memList').innerHTML = keys.map(c=>{
+    const rows = groups.get(c);
+    return `<div class="mem-group">
+      <div class="mem-group-head">
+        <span class="mem-group-title" style="color:${catColor(c)}">${esc(c)}</span>
+        <span class="mem-group-count">${rows.length} 条</span>
+      </div>
+      ${rows.map(m=>memCard(m, showScore)).join('')}
+    </div>`;
+  }).join('');
+}
+
+// ---------------- 按访问热度分组 ----------------
+// 档位与后端 /api/memories/breakdown 的 by_heat 一致：按 access_count 绝对值，
+// 不用分位数 —— 分位数在"全库都是 0"时仍会造出四档，看起来像有数据。
+const HEAT_TIERS = [
+  { key:'hot',       label:'常翻的',   lo:10, hi:null },
+  { key:'warm',      label:'偶尔翻',   lo:3,  hi:10   },
+  { key:'cold',      label:'冷门',     lo:1,  hi:3    },
+  { key:'untouched', label:'从没翻过', lo:0,  hi:1    },
+];
+function heatOf(m){
+  const n = Number(m.access_count || 0);
+  return HEAT_TIERS.find(t => n >= t.lo && (t.hi === null || n < t.hi)) || HEAT_TIERS[3];
+}
+function renderByHeat(list, showScore){
+  const groups = new Map(HEAT_TIERS.map(t=>[t.key, []]));
+  for(const m of list) groups.get(heatOf(m).key).push(m);
+  const touched = list.filter(m=>Number(m.access_count||0) > 0).length;
+  const note = touched === 0
+    ? `<div class="hint" style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.7">
+         这 ${list.length} 条都还没有访问记录 —— 访问统计是这一版才接上的，
+         以前的召回不会记账。所以「从没翻过」并不代表没人关心它们。</div>`
+    : `<div class="hint" style="margin:0 0 10px;color:var(--muted);font-size:12px">
+         有访问记录 ${touched} 条，没有 ${list.length - touched} 条。</div>`;
+  const parts = HEAT_TIERS.map(t=>{
+    const rows = groups.get(t.key);
+    if(!rows.length) return '';
+    return `<div class="mem-group">
+      <div class="mem-group-head">
+        <span class="mem-group-title">${t.label}</span>
+        <span class="mem-group-count">${rows.length} 条</span>
+        ${t.key!=='untouched' ? `<span class="mem-group-count">翻过 ${
+          rows.reduce((a,m)=>a+Number(m.access_count||0),0)} 次</span>` : ''}
+      </div>
+      ${rows.map(m=>memCard(m, showScore)).join('')}
+    </div>`;
+  }).join('');
+  $('#memList').innerHTML = note + parts;
+}
+
+// ---------------- 时间轴视图 ----------------
+// 分组列表看不见"空白期"（没有记忆的日子直接不存在），时间轴能。
+// 每格代表一天，深浅表示当天条数，空白格也画出来。
+function renderTimeline(list, showScore){
+  const axis = $('#memAxis').value === 'updated' ? 'updated_at' : 'created_at';
+  const counts = new Map();
+  let oldest = null, newest = null;
+  for(const m of list){
+    const ts = parseTs(m[axis]) ?? parseTs(m.created_at);
+    if(ts === null) continue;
+    const k = dayKey(ts);
+    counts.set(k, (counts.get(k)||0) + 1);
+    if(oldest === null || k < oldest) oldest = k;
+    if(newest === null || k > newest) newest = k;
+  }
+  if(oldest === null){
+    $('#memList').innerHTML = '<div class="empty">这些记忆都没有可用的时间</div>';
+    return;
+  }
+  const maxCount = Math.max(...counts.values());
+  // 起止都向两边各扩 2 天，让边缘的格子看着不贴边
+  const start = new Date(oldest + 'T00:00:00'); start.setDate(start.getDate() - 2);
+  const end = new Date(newest + 'T00:00:00'); end.setDate(end.getDate() + 2);
+  const cells = [];
+  let cursor = new Date(start);
+  while(cursor <= end){
+    const k = dayKey(cursor.getTime());
+    const n = counts.get(k) || 0;
+    const ratio = maxCount ? n / maxCount : 0;
+    // 空白格也给一点底色，否则分不清"这天没记"和"这天不在范围内"
+    const bg = n === 0 ? 'var(--line, #232833)'
+      : `rgba(111,179,242,${(0.18 + 0.72*ratio).toFixed(3)})`;
+    const title = `${k} · ${n} 条`;
+    cells.push(`<div class="tl-cell" data-day="${k}" title="${title}"
+      style="background:${bg};${n?'cursor:pointer':''}"></div>`);
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  const activeDays = counts.size;
+  $('#memList').innerHTML = `
+    <div class="hint" style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.8">
+      <b>${list.length} 条</b>记忆分布在 <b>${activeDays} 天</b>里（${oldest} ~ ${newest}）。
+      格子越亮当天记得越多，深灰格是那天没有记录 —— 空白期在分组列表里是看不见的。
+    </div>
+    <div class="tl-grid">${cells.join('')}</div>
+    <div class="tl-legend">
+      <span>少</span>
+      <span class="tl-swatch" style="background:var(--line, #232833)"></span>
+      <span class="tl-swatch" style="background:rgba(111,179,242,0.18)"></span>
+      <span class="tl-swatch" style="background:rgba(111,179,242,0.55)"></span>
+      <span class="tl-swatch" style="background:rgba(111,179,242,0.9)"></span>
+      <span>多</span>
+    </div>
+    <div id="tlDetail"></div>`;
+  $$('#memList .tl-cell').forEach(cell=>{
+    if(!counts.get(cell.dataset.day)) return;
+    cell.onclick = ()=>{
+      const k = cell.dataset.day;
+      const rows = list.filter(m=>{
+        const ts = parseTs(m[axis]) ?? parseTs(m.created_at);
+        return ts !== null && dayKey(ts) === k;
+      });
+      $('#tlDetail').innerHTML = `<div class="mem-group" style="margin-top:14px">
+        <div class="mem-group-head">
+          <span class="mem-group-title">${esc(dayLabel(k))}</span>
+          <span class="mem-group-count">${rows.length} 条</span>
+        </div>
+        ${rows.map(m=>memCard(m, showScore)).join('')}
+      </div>`;
+      $('#tlDetail').scrollIntoView({behavior:'smooth', block:'nearest'});
+    };
+  });
+}
+
 // 把当前查询结果按时间分档渲染
 function renderMemoryGroups(list, showScore){
   if(!list.length){
@@ -1221,6 +1375,18 @@ function renderMemoryGroups(list, showScore){
   const mode = $('#memGroupBy').value;
   if(mode === 'none'){
     $('#memList').innerHTML = list.map(m=>memCard(m, showScore)).join('');
+    return;
+  }
+  if(mode === 'category'){
+    renderByCategory(list, showScore);
+    return;
+  }
+  if(mode === 'heat'){
+    renderByHeat(list, showScore);
+    return;
+  }
+  if(mode === 'timeline'){
+    renderTimeline(list, showScore);
     return;
   }
   const axis = $('#memAxis').value === 'updated' ? 'updated_at' : 'created_at';
