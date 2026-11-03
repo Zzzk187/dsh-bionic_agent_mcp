@@ -51,6 +51,22 @@ def _keyword_only_search(query: str, limit: int, category: str) -> list[dict]:
     rows = _life._keyword_fallback(query, limit=limit, category=category)
     return [_life._clean(dict(r)) for r in rows]
 
+def _touch_retrieved(items) -> None:
+    """Record a real retrieval for the items actually returned to the caller.
+
+    Only access_count / last_accessed_at move (the raw signal behind the
+    frequency component). No confidence change, no feedback row, no rescore —
+    so "being surfaced must not promote a memory" still holds.
+    """
+    if not items:
+        return
+    try:
+        ids = [int(it["id"]) for it in items if it.get("id") is not None]
+        gov.touch_access(ids)
+    except Exception:  # noqa: BLE001 — bookkeeping must not break retrieval
+        pass
+
+
 def _event(event_type: str, detail: str, task_id=None):
     with connect() as conn:
         conn.execute(
@@ -636,9 +652,11 @@ def semantic_search_memories(query: str, limit: int = 10, category: str = "",
         # immediately instead of blocking on the MCP client timeout.
         from app.embeddings import is_ready
         if not is_ready():
+            degraded = _keyword_only_search(query, limit, category)
+            _touch_retrieved(degraded)
             return {"ok": True, "degraded": True, "reason": "model_not_ready",
                     "message": "嵌入模型仍在后台加载/下载，已降级为关键词检索。可稍后重试或先调用 warmup_embeddings。",
-                    "results": _keyword_only_search(query, limit, category)}
+                    "results": degraded}
         return {"ok": False, "error": str(exc), "hint": "检查 fastembed 依赖和模型下载。"}
     with connect() as conn:
         if category.strip():
@@ -667,7 +685,14 @@ def semantic_search_memories(query: str, limit: int = 10, category: str = "",
         item['similarity'] = round(score, 6)
         scored.append(item)
     scored.sort(key=lambda x: (x['similarity'], x.get('updated_at', '')), reverse=True)
-    return scored[:limit]
+    result = scored[:limit]
+    # Record a real retrieval. Mirrors memory_lifecycle.recall_memories, which
+    # has always done this; without it access_count stayed at 0 forever and
+    # "was this memory ever used?" could not be answered.
+    # Placed after slicing: we count what was actually returned to the caller,
+    # not every candidate that happened to be scored.
+    _touch_retrieved(result)
+    return result
 
 # ==========================================================================
 # Phase 5: autonomous memory governance
