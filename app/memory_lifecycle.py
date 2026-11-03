@@ -178,6 +178,21 @@ _TYPE_HINTS = [
         r"昨天|前天|上次|刚才|那次|当时|会议|讨论|发生|今天)", re.I)),
 ]
 
+#: Non-English category names -> memory type.
+#:
+#: dsh-memory (the system this instance mirrors) files memories under Chinese
+#: section names, so `category` arrives as 环境 / 项目 / 教训 / 授权. The check
+#: below used to be `cat in MEMORY_TYPES` alone, which silently rejected every
+#: one of them: the category signal — documented as "stronger than free text" —
+#: contributed nothing at all on imported rows. Keep this map explicit rather
+#: than guessing from the characters, so each mapping can be argued with.
+_CATEGORY_TYPE = {
+    "环境": "semantic",     # facts about this machine/setup
+    "项目": "semantic",     # project inventory and status
+    "教训": "reflection",   # lessons learned / post-mortems
+    "授权": "preference",   # standing authorizations and user profile
+}
+
 
 def classify_memory_type(content: str, category: str = "", source: str = "") -> dict:
     """Deterministic, explainable type guess. Never returns a forced bucket.
@@ -191,11 +206,18 @@ def classify_memory_type(content: str, category: str = "", source: str = "") -> 
     for t, pat in _TYPE_HINTS:
         if pat.search(text):
             hits.append(t)
-    # Category is a stronger signal than free text.
+    # Category is a stronger signal than free text. Resolve it through
+    # _CATEGORY_TYPE so non-English section names count too (see the note
+    # there); an English type name is accepted as-is.
     cat = (category or "").lower().strip()
-    if cat in MEMORY_TYPES and cat != "unknown":
-        if cat not in hits:
-            hits.insert(0, cat)
+    cat_type = ""
+    raw_cat = (category or "").strip()
+    if raw_cat in _CATEGORY_TYPE:
+        cat_type = _CATEGORY_TYPE[raw_cat]
+    elif cat in MEMORY_TYPES and cat != "unknown":
+        cat_type = cat
+    if cat_type and cat_type not in hits:
+        hits.insert(0, cat_type)
     reasons = [f"matched '{h}' signals" for h in hits]
     if not hits:
         return {
@@ -207,13 +229,31 @@ def classify_memory_type(content: str, category: str = "", source: str = "") -> 
     # Multiple distinct type hints => ambiguous.
     distinct = sorted(set(hits))
     if len(distinct) > 1:
+        # Pick the category-derived type, not `distinct[0]`. Sorted order is
+        # alphabetical, so the old code let the spelling of a type name decide
+        # the outcome: a 教训 row matching both "procedural" and "reflection"
+        # always came out procedural even though its category said reflection.
+        # The category is the stated strong signal, so it wins; with no
+        # category signal we fall back to the hint order in _TYPE_HINTS
+        # (most-specific first), which is stable and explainable.
+        chosen = cat_type or next(t for t, _ in _TYPE_HINTS if t in distinct)
+        if chosen not in distinct:
+            chosen = distinct[0]
+        by_category = bool(cat_type) and chosen == cat_type
         return {
-            "memory_type": distinct[0],
-            "confidence": 0.4,
-            "reasons": reasons + [f"ambiguous: also matched {distinct[1:]}"],
-            "needs_review": True,
+            "memory_type": chosen,
+            # A category that decided the tie is NOT a guess: the category
+            # records which volume a human filed the memory under, while the
+            # extra hits are keyword coincidences. Flagging that as 0.4 /
+            # needs_review would queue dozens of import rows for adjudication
+            # that has already been made once, at filing time. Only a tie
+            # broken by hint order (no category at all) is genuinely uncertain.
+            "confidence": 0.75 if by_category else 0.4,
+            "reasons": reasons + [f"ambiguous: also matched {[d for d in distinct if d != chosen]}",
+                                  f"chosen by {'category' if by_category else 'hint order'}"],
+            "needs_review": not by_category,
         }
-    conf = 0.85 if cat == distinct[0] else 0.6
+    conf = 0.85 if cat_type == distinct[0] else 0.6
     return {
         "memory_type": distinct[0],
         "confidence": conf,
