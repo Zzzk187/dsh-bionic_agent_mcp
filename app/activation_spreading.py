@@ -40,6 +40,14 @@ DEFAULT_DECAY = 0.5          # activation multiplier per graph hop
 DEFAULT_MAX_DEPTH = 2        # how many hops activation may travel
 DEFAULT_WINDOW_DAYS = 30     # recency window for "recently activated" seeds
 
+# How strongly a memory's own usage history seeds activation. A usage seed is
+# weaker than an explicit one on purpose: `record_memory_activation` means "the
+# user just said this is relevant again" and deserves 1.0, while being read a
+# few times is evidence, not a statement. At 0.5 a well-used memory seeds its
+# neighbours at 0.25 (one hop) -- enough to break a tie, not enough to outrank
+# the memory the query actually just retrieved.
+USAGE_SEED_WEIGHT = 0.5
+
 
 # --------------------------------------------------------------------------
 # Graph construction
@@ -218,22 +226,44 @@ def compute_activation(memory_ids: Optional[list[int]] = None,
                        max_depth: int = DEFAULT_MAX_DEPTH,
                        include_recent_events: bool = True,
                        window_days: int = DEFAULT_WINDOW_DAYS,
+                       include_usage_seeds: bool = True,
                        conn=None) -> dict:
     """Build the graph, gather seeds, and return the spread result.
 
-    Seeds = explicit recent activations (if requested) + the provided
-    `memory_ids` (each as a full-strength seed of 1.0, e.g. the memory the user
-    just retrieved). If `memory_ids` is None and include_recent_events is False,
-    returns an empty result (nothing to spread from).
+    Seeds come from three places, strongest last:
+
+    1. **usage history** (`include_usage_seeds`) -- a memory that has been
+       retrieved repeatedly and recently seeds at `USAGE_SEED_WEIGHT`. Without
+       this the `access_count` column was write-only: it fed the frequency term
+       but never made a memory's *neighbours* more relevant, so the graph was
+       only ever entered through explicit human marks.
+    2. **explicit recent activations** (`include_recent_events`) -- the audit
+       trail of `record_memory_activation`, full strength.
+    3. **the provided `memory_ids`** -- what the query just recalled, 1.0.
+
+    Later sources win a collision, which is why the loop order is fixed: a
+    memory the user just asked about must not be demoted to its usage weight.
+    If every source is empty, returns an empty result (nothing to spread from).
     """
     def _run(c):
         graph = build_activation_graph(c)
         seeds: dict[int, float] = {}
+        if include_usage_seeds:
+            rows = c.execute(
+                "SELECT id, access_count, last_accessed_at, updated_at, supersedes_id"
+                " FROM memories WHERE status='active'"
+                " AND (access_count > 0 OR last_accessed_at IS NOT NULL)"
+            ).fetchall()
+            for r in rows:
+                w = seed_activation_from_row(dict(r), window_days=window_days)
+                if w > 0:
+                    seeds[int(r["id"])] = round(w * USAGE_SEED_WEIGHT, 4)
         if include_recent_events:
             seeds.update(_recently_activated_seeds(c, window_days))
         if memory_ids:
             for mid in memory_ids:
                 seeds[int(mid)] = 1.0
+        seeds = {k: v for k, v in seeds.items() if v > 0}
         if not seeds:
             return {"ok": True, "activation": {}, "seeds": 0,
                     "graph_edges": sum(len(v) for v in graph.values()) // 2}

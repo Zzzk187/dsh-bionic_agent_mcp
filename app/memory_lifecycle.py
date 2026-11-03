@@ -394,7 +394,13 @@ def recall_memories(query: str = "", top_k: int = 5, category: str = "",
         seeds = [d["id"] for d in rows
                  if (sem.get(d["id"]) is not None and sem.get(d["id"]) >= 0.45)
                  or _keyword_score(query, dict(d).get("content", "")) >= 0.3]
-        spread = spreading.activation_for_seed_query(c, seeds) if seeds else {}
+        # Even when nothing in the query hits hard enough to be a seed, usage
+        # history still has something to say: a memory that keeps getting read
+        # seeds its neighbours. Short-circuiting on an empty seed list, as this
+        # used to, made the usage-seed path dead code for precisely the vague
+        # queries that need it most -- only well-matched queries ever spread.
+        spread = (spreading.activation_for_seed_query(c, seeds) if seeds
+                  else spreading.compute_activation(conn=c).get("activation", {}))
         # One query for every feedback row instead of one per candidate: the
         # feedback table is small and N+1 lookups here would be the hot path.
         fb_rows = {}
