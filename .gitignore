@@ -17,6 +17,15 @@ data/admin_ui.log
 *.db-wal
 *.db-shm
 
+# Downloaded embedding model (~241 MB, re-fetched with HF_ENDPOINT on first run)
+data/model_cache/
+
+# Whole-database snapshots (each is a multi-hundred-KB dump of the private db)
+data/snapshots/
+
+# Hand-made backups of source files, kept only until the change is verified
+*.bak-*
+
 # Distribution artifacts (regenerate with build_zip.py)
 *.zip
 dist/
