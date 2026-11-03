@@ -745,7 +745,8 @@ def find_duplicate_memories(memory_ids: Optional[list[int]] = None, category: st
                                     candidate_count=candidate_count, persist=False)
     findings = det.get("findings", []) if isinstance(det, dict) else det
     dups = [f for f in findings if isinstance(f, dict)
-            and f.get("conflict_type") in ("duplicate", "correction")]
+            and f.get("conflict_type") in ("duplicate", "correction")
+            and not f.get("prior_resolution")]
     return {"ok": True, "duplicate_count": len(dups), "duplicates": dups}
 
 
@@ -795,6 +796,11 @@ def consolidate_memory_candidates(persist: bool = False, limit: int = 50,
             return protection.assess(d, {"importance": float(d.get("importance_score") or 0.0)})
 
         for f in findings:
+            # A pair a human already judged is settled data, not a fresh lead:
+            # re-emitting it every scan is how a triaged queue silently turns
+            # back into an untriaged one.
+            if f.get("prior_resolution"):
+                continue
             if f.get("conflict_type") in ("duplicate", "correction"):
                 pair_ids = [f.get("memory_id"), f.get("candidate_memory_id")]
                 if any(_tier(next((r for r in rows if r["id"] == pid), {}))["blocks"]["auto_merge"]

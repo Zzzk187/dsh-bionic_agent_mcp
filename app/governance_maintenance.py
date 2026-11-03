@@ -95,41 +95,14 @@ def _build_plan(conn, rules: dict, limit: int, category: str,
         scored[row["id"]] = score_memory(row, ctx, rules, now=now)
 
     # Duplicate / conflict detection (persisted only when requested).
+    # Both branches go through detect_conflicts so prior human verdicts are
+    # honoured identically in preview and in the persisted run; the dry-run copy
+    # of the scan loop that used to live here could not see them at all.
     conflicts_written = 0
-    conflict_findings = []
+    det = detect_conflicts(persist=bool(persist_conflicts), category=category)
     if persist_conflicts:
-        det = detect_conflicts(persist=True, category=category)
         conflicts_written = det.get("written", 0)
-        conflict_findings = det.get("findings", [])
-    else:
-        # Dry run: compute without writing.
-        sims = _similarity_matrix(conn, rows, rules)
-        by_id = {r["id"]: r for r in rows}
-        neighbours: dict[int, list[tuple[int, float]]] = {}
-        for (a, b), sim in sims.items():
-            neighbours.setdefault(a, []).append((b, sim))
-            neighbours.setdefault(b, []).append((a, sim))
-        top_n = int(rules.get("candidate_count", 8))
-        for k in neighbours:
-            neighbours[k].sort(key=lambda x: x[1], reverse=True)
-            neighbours[k] = neighbours[k][:top_n]
-        seen: set[tuple[int, int]] = set()
-        for a_id, cands in sorted(neighbours.items()):
-            for b_id, sim in cands:
-                key = (min(a_id, b_id), max(a_id, b_id))
-                if key in seen:
-                    continue
-                seen.add(key)
-                old_id, new_id = sorted(key)
-                verdict = classify_pair(by_id[old_id], by_id[new_id], sim, rules)
-                if verdict is None:
-                    continue
-                conflict_findings.append({
-                    "memory_id": old_id, "candidate_memory_id": new_id,
-                    "similarity": sim, "conflict_type": verdict["conflict_type"],
-                    "needs_review": needs_review(verdict),
-                    **verdict,
-                })
+    conflict_findings = det.get("findings", [])
 
     plan: list[dict] = []
     archive_candidates = 0
@@ -170,6 +143,8 @@ def _build_plan(conn, rules: dict, limit: int, category: str,
         # supersede_from_conflict — never silently overwritten).
         if not (f.get("needs_review") or ftype in ("duplicate", "correction")):
             continue
+        if f.get("prior_resolution"):
+            continue  # already adjudicated; do not re-queue for review
         mid = f["candidate_memory_id"]
         cur = _one("SELECT memory_status FROM memories WHERE id=?", (int(mid),))
         prev_ms = cur.get("memory_status") if cur else None

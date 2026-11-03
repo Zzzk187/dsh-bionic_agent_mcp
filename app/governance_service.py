@@ -36,19 +36,39 @@ ACTION_RESTORE = "restore"
 ACTION_PROTECT = "protect"
 ACTION_UNPROTECT = "unprotect"
 ACTION_MARK_REVIEW = "mark_review"
+ACTION_MARK_REVIEW_REVERT = "mark_review_revert"
 ACTION_SUPERSEDE = "supersede"
 ACTION_UPDATE_VECTOR = "update_vector"
 
 # Actions that change memory content/status and therefore require approval.
 DESTRUCTIVE_ACTIONS = {ACTION_ARCHIVE, ACTION_SUPERSEDE, ACTION_RESTORE,
-                       ACTION_PROTECT, ACTION_UNPROTECT, ACTION_MARK_REVIEW}
+                       ACTION_PROTECT, ACTION_UNPROTECT, ACTION_MARK_REVIEW,
+                       ACTION_MARK_REVIEW_REVERT}
 
 REVERSIBLE_ACTIONS = {ACTION_ARCHIVE, ACTION_RESTORE, ACTION_PROTECT,
-                      ACTION_UNPROTECT, ACTION_MARK_REVIEW, ACTION_SCORE}
+                      ACTION_UNPROTECT, ACTION_MARK_REVIEW,
+                      ACTION_MARK_REVIEW_REVERT, ACTION_SCORE}
 
 
 def _now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_ts(value):
+    """Parse the timestamp shapes this DB actually stores (naive == UTC)."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ",
+                "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
 
 
 def _json(value) -> str:
@@ -355,6 +375,10 @@ def detect_conflicts(memory_ids: list[int] | None = None, category: str = "",
             wanted = {int(i) for i in memory_ids}
             rows = [r for r in rows if r["id"] in wanted]
         sims = _similarity_matrix(conn, rows, rules)
+        # A verdict a human already wrote down is data, not noise: without this
+        # the same N pairs come back on every scan and the second report of a
+        # settled question reads exactly like an unsettled one.
+        verdicts = _adjudications(conn)
 
     by_id = {r["id"]: r for r in rows}
     # Keep only the top-N most similar candidates per memory (5-10, configurable).
@@ -379,18 +403,33 @@ def detect_conflicts(memory_ids: list[int] | None = None, category: str = "",
             verdict = classify_pair(by_id[old_id], by_id[new_id], sim, rules)
             if verdict is None:
                 continue
-            findings.append({
+            finding = {
                 "memory_id": old_id,
                 "candidate_memory_id": new_id,
                 "content_preview": (by_id[old_id].get("content") or "")[:120],
                 "candidate_preview": (by_id[new_id].get("content") or "")[:120],
                 **verdict,
                 "needs_review": needs_review(verdict),
-            })
+            }
+            prior = _matching_adjudication(verdicts, finding, verdict)
+            if prior:
+                finding["needs_review"] = False
+                finding["prior_resolution"] = {
+                    "conflict_id": prior["id"],
+                    "resolution": prior["resolution"],
+                    "resolved_at": prior["resolved_at"],
+                    "resolved_by": prior["resolved_by"],
+                }
+            findings.append(finding)
 
     written = 0
-    if persist and findings:
-        written = _persist_conflicts(findings, None, rules)
+    if persist:
+        # Only what still needs a decision gets persisted. Writing the settled
+        # ones back would keep flipping resolved rows to 'pending' through the
+        # ON CONFLICT clause, and the table would never empty out.
+        fresh = [f for f in findings if not f.get("prior_resolution")]
+        if fresh:
+            written = _persist_conflicts(fresh, None, rules)
 
     counts: dict[str, int] = {}
     for f in findings:
@@ -406,8 +445,65 @@ def detect_conflicts(memory_ids: list[int] | None = None, category: str = "",
         "written": written,
         "counts_by_type": counts,
         "needs_review": sum(1 for f in findings if f["needs_review"]),
+        "settled_earlier": sum(1 for f in findings if f.get("prior_resolution")),
         "findings": findings,
     }
+
+
+def _adjudications(conn) -> dict[tuple[int, int], dict]:
+    """Every conflict row a human has already decided, keyed by memory pair.
+
+    Keyed by pair, not by conflict_type: memory ids are unique and stable, and
+    re-classifying a settled pair with a slightly different label is exactly how
+    a settled question comes back. An edit to either memory (updated_at newer
+    than the verdict) invalidates the verdict for that pair — the content moved,
+    so the old judgement is no longer about this text.
+    """
+    rows = conn.execute(
+        """SELECT c.id, c.memory_id, c.candidate_memory_id, c.resolution,
+                  c.resolved_at, c.resolved_by,
+                  a.status AS a_status, b.status AS b_status,
+                  a.updated_at AS a_updated, b.updated_at AS b_updated
+             FROM memory_conflicts c
+             LEFT JOIN memories a ON a.id=c.memory_id
+             LEFT JOIN memories b ON b.id=c.candidate_memory_id
+            WHERE c.resolution IS NOT NULL AND c.resolution!='pending'""").fetchall()
+    verdicts: dict[tuple[int, int], dict] = {}
+    for r in rows:
+        row = db.rowdict(r)
+        a_id, b_id = row.get("memory_id"), row.get("candidate_memory_id")
+        if a_id is None or b_id is None:
+            continue
+        if _content_changed_since(row, "a_updated", row.get("resolved_at")) or \
+           _content_changed_since(row, "b_updated", row.get("resolved_at")):
+            continue
+        if (row.get("a_status") or "active") != "active" or \
+           (row.get("b_status") or "active") != "active":
+            continue
+        key = (min(int(a_id), int(b_id)), max(int(a_id), int(b_id)))
+        verdicts[key] = row
+    return verdicts
+
+
+def _content_changed_since(row: dict, updated_key: str, resolved_at) -> bool:
+    updated = _parse_ts(row.get(updated_key))
+    resolved = _parse_ts(resolved_at)
+    if updated is None or resolved is None:
+        return False
+    return updated > resolved
+
+
+def _matching_adjudication(verdicts: dict, finding: dict, verdict: dict):
+    prior = verdicts.get((min(finding["memory_id"], finding["candidate_memory_id"]),
+                          max(finding["memory_id"], finding["candidate_memory_id"])))
+    if not prior:
+        return None
+    # A settled 'not a conflict' says nothing when the pair has since become a
+    # hard factual contradiction (value_conflict); only that upgrade reopens it.
+    if prior.get("resolution") == RESOLUTION_NOT_CONFLICT and \
+            verdict.get("conflict_type") in ("value_conflict", "duplicate", "correction"):
+        return None
+    return prior
 
 
 def _persist_conflicts(findings: list[dict], run_id: int | None, rules: dict) -> int:
@@ -526,6 +622,25 @@ def review_conflict(conflict_id: int, resolution: str, note: str = "",
                         result["archived_memory_id"] = loser
             elif resolution == RESOLUTION_NOT_CONFLICT or resolution == RESOLUTION_KEPT_BOTH:
                 result["message"] = "判定为不冲突/共存，两条记忆均保留"
+
+            # A human has now looked at this pair. Any pending_review hold that
+            # this pair put on either memory has served its purpose -- leaving it
+            # in place would hide the memory from every recall path permanently
+            # (`pending_review` is an exclusion flag, not a display state).
+            # `pending` means "re-open", so the hold is deliberately kept.
+            if resolution != RESOLUTION_PENDING:
+                released = []
+                for mid in (int(row["memory_id"]), int(row["candidate_memory_id"])):
+                    if _release_review(conn, mid,
+                                       f"冲突 {conflict_id} 已裁决为 {resolution}",
+                                       row.get("rule_version") or "",
+                                       resolved_by):
+                        released.append(mid)
+                if released:
+                    result["review_released"] = released
+                    extra = f"；已解除待审核保留：{released}"
+                    result["message"] = (result.get("message") or "") + extra
+                    result["message"] = result["message"].lstrip("；")
     except Exception as exc:
         return {"ok": False, "message": f"裁决执行失败，已回滚：{exc}",
                 "conflict_id": int(conflict_id)}
@@ -844,6 +959,14 @@ def rollback_governance_action(action_id: int, reason: str = "") -> dict:
                 conn.execute(
                     "UPDATE memories SET memory_status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (prev_ms, int(row["memory_id"])))
+            elif action_type == ACTION_MARK_REVIEW_REVERT:
+                # Releasing a hold is itself reversible: rollback re-applies it,
+                # so an accidental approval does not permanently hide a memory.
+                prev_ms = info.get("previous_memory_status", "pending_review") \
+                    or "pending_review"
+                conn.execute(
+                    "UPDATE memories SET memory_status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (prev_ms, int(row["memory_id"])))
             elif action_type == ACTION_SUPERSEDE:
                 # 6.2: full, idempotent rollback of an explicit correction.
                 old_id = int(row["memory_id"])
@@ -896,6 +1019,43 @@ def rollback_governance_action(action_id: int, reason: str = "") -> dict:
             "changed": True, "message": "已回滚该治理动作"}
 
 
+def _release_review(conn, memory_id: int, reason: str, rule_version: str,
+                    approver: str) -> bool:
+    """Internal: lift a `pending_review` hold inside an open transaction.
+
+    `pending_review` is an EXCLUSION flag: recall, semantic and keyword search
+    all filter it out, so a memory stuck there is invisible to the agent while
+    still counting as active. Adjudicating the conflict that put it there is the
+    normal way out, and this is the only exit -- without it the hold is a
+    one-way door and the memory is lost to retrieval forever.
+
+    Returns True when a hold was actually lifted. A memory that is not held (or
+    is archived/superseded) is left untouched, so this stays idempotent.
+    """
+    before = db.rowdict(conn.execute(
+        "SELECT id,status,memory_status FROM memories WHERE id=?",
+        (int(memory_id),)).fetchone())
+    if not before:
+        return False
+    if before.get("status") != "active":
+        return False
+    if (before.get("memory_status") or "active") != "pending_review":
+        return False
+    conn.execute(
+        "UPDATE memories SET memory_status='active', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (int(memory_id),))
+    record_action(conn, ACTION_MARK_REVIEW_REVERT, int(memory_id),
+                  old_value={"memory_status": "pending_review"},
+                  new_value={"memory_status": "active"},
+                  reason=reason or "解除人工裁决保留",
+                  rule_version=rule_version,
+                  rollback_info={"reverse_action": "mark_review",
+                                 "previous_memory_status": "pending_review"})
+    _event(conn, "governance.review_released",
+           f"memory_id={int(memory_id)}; reason={reason[:200]}; approver={approver[:50]}")
+    return True
+
+
 def _mark_review(conn, memory_id: int, reason: str, rule_version: str,
                  approver: str) -> tuple[dict | None, str | None]:
     """Internal: set a memory to pending_review inside an open transaction."""
@@ -933,5 +1093,38 @@ def set_review_status(memory_id: int, reason: str = "", approver: str = "user") 
             if err:
                 raise RuntimeError(err)
         return {"ok": True, "memory_id": int(memory_id), "memory_status": "pending_review"}
+    except Exception as exc:
+        return {"ok": False, "message": str(exc), "memory_id": int(memory_id)}
+
+
+def release_review_status(memory_id: int, reason: str = "",
+                          approver: str = "user") -> dict:
+    """Lift a `pending_review` hold so the memory becomes retrievable again.
+
+    The counterpart of `set_review_status`. A held memory is excluded from
+    recall, semantic search and keyword search alike, so without an explicit
+    release path a hold is a one-way door: the memory stays "active" in the DB
+    and silently disappears from everything the agent can see.
+
+    Only active memories can be released, and only when actually held; both
+    conditions report themselves instead of pretending to have changed anything.
+    """
+    row = _one("SELECT * FROM memories WHERE id=?", (int(memory_id),))
+    if not row:
+        return {"ok": False, "message": "Memory not found", "memory_id": int(memory_id)}
+    rules = load_rules()
+    try:
+        with db.transaction() as conn:
+            changed = _release_review(conn, memory_id, reason,
+                                      rules["rule_version"], approver)
+        if not changed:
+            current = (row.get("memory_status") or "active")
+            why = ("记忆不是待审核状态，无需解除" if current != "pending_review"
+                   else "记忆不是活跃状态，无法解除待审核")
+            return {"ok": True, "memory_id": int(memory_id),
+                    "memory_status": current, "changed": False, "message": why}
+        return {"ok": True, "memory_id": int(memory_id),
+                "memory_status": "active", "changed": True,
+                "message": "已解除待审核保留，记忆重新进入检索"}
     except Exception as exc:
         return {"ok": False, "message": str(exc), "memory_id": int(memory_id)}

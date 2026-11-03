@@ -110,6 +110,28 @@ def main() -> int:
         check("列表接口不记访问（翻页不等于看过）",
               after_list == before_list, f"{before_list} -> {after_list}")
 
+        # ---- 6) 待审核的进与出都要有 Web 出口 ----
+        # 只给"置待审"不给"解除"，等于界面上一点就把记忆永久藏起来。
+        target = ids[3]
+        client.post(f"/api/memories/{target}/review", json={"reason": "测试置待审"})
+        with db.connect() as conn:
+            held = conn.execute("SELECT memory_status FROM memories WHERE id=?",
+                                (target,)).fetchone()[0]
+        check("Web 置待审生效", held == "pending_review", str(held))
+        hidden = {m["id"] for m in client.get("/api/memories?limit=50").json()["data"]}
+        check("待审记忆从列表里消失", target not in hidden, f"{sorted(hidden)}")
+
+        rel = client.post(f"/api/memories/{target}/review/release",
+                          json={"reason": "测试解除"}).json()
+        check("Web 解除待审成功", rel.get("ok") is True
+              and (rel.get("data") or {}).get("changed") is True, str(rel)[:120])
+        with db.connect() as conn:
+            back = conn.execute("SELECT memory_status FROM memories WHERE id=?",
+                                (target,)).fetchone()[0]
+        check("解除后回到 active", back == "active", str(back))
+        visible = {m["id"] for m in client.get("/api/memories?limit=50").json()["data"]}
+        check("解除后重新出现在列表里", target in visible, f"{sorted(visible)}")
+
     failed = [r for r in RESULTS if not r[1]]
     print(f"\n=== {len(RESULTS) - len(failed)}/{len(RESULTS)} 通过 ===")
     return 0 if not failed else 1

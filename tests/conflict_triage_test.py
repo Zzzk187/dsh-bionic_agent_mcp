@@ -189,6 +189,44 @@ def test_values_do_not_break_persistence():
     check("能列出", listed.get("ok") is not False, str(listed.get("count")))
 
 
+def test_prior_verdict_is_honoured():
+    print("\n=== 已裁决的对不该在下次扫描里复活 ===")
+    fresh()
+    a = mcp.save_memory(content="当前版本 0.2.1", category="环境")
+    b = mcp.save_memory(content="当前版本 0.2.5", category="环境")
+    with db.transaction() as conn:
+        conn.execute("UPDATE memories SET tags_json='[\"ver\"]'")
+    first = mcp.detect_memory_conflicts(persist=True)
+    check("先有一条待裁决", first.get("needs_review", 0) >= 1,
+          str(first.get("needs_review")))
+    with db.connect() as conn:
+        cid = conn.execute("SELECT id FROM memory_conflicts LIMIT 1").fetchone()[0]
+    mcp.review_memory_conflict(conflict_id=cid, resolution="kept_both",
+                               note="两条是同一事实的两次取值，都保留")
+    again = mcp.detect_memory_conflicts(persist=True)
+    check("同一对被标为已裁决", again.get("settled_earlier", 0) >= 1,
+          str(again.get("settled_earlier")))
+    check("不再要求人工裁决", again.get("needs_review", 0) == 0,
+          str(again.get("needs_review")))
+    with db.connect() as conn:
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM memory_conflicts WHERE resolution='pending'"
+        ).fetchone()[0]
+    check("裁决没被扫回 pending", pending == 0, f"{pending} 条 pending")
+
+    # 内容改动后旧裁决失效：判的是旧文本，不是现在这段。
+    # 改后的值要和原来像（同类事实换个数），否则相似度先掉下阈值、
+    # 这一对根本不会进候选，测不出"裁决失效"这件事。
+    with db.transaction() as conn:
+        conn.execute("UPDATE memories SET content=?, updated_at=? WHERE id=?",
+                     ("当前版本 0.3.1", "2099-01-01 00:00:00", b["id"]))
+    reopened = mcp.detect_memory_conflicts(persist=False)
+    hit = [f for f in reopened.get("findings") or []
+           if {f["memory_id"], f["candidate_memory_id"]} == {a["id"], b["id"]}
+           and not f.get("prior_resolution")]
+    check("内容改过 → 裁决失效重新待判", len(hit) >= 1, f"{len(hit)} 条重开")
+
+
 def run():
     test_value_extraction()
     test_value_conflict_detected()
@@ -197,6 +235,7 @@ def run():
     test_skeleton_threshold()
     test_end_to_end_through_mcp()
     test_values_do_not_break_persistence()
+    test_prior_verdict_is_honoured()
     failed = [r for r in RESULTS if not r[1]]
     print(f"\n=== {len(RESULTS) - len(failed)}/{len(RESULTS)} 通过 ===")
     return 1 if failed else 0

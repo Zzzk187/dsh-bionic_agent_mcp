@@ -954,6 +954,24 @@ def set_review_status(memory_id: int, reason: str = "", approver: str = "user") 
                                  approver=str(approver or "user"))
 
 
+@mcp_gov.tool()
+def release_review_status(memory_id: int, reason: str = "",
+                          approver: str = "user") -> dict:
+    """解除 pending_review（待审核保留），让记忆重新进入检索。
+
+    pending_review 是**排除标记**：召回、语义检索、关键词检索都会把它过滤掉。
+    所以在没有解除路径的情况下，一次 mark_review 就等于把这条记忆永久藏起来。
+    人工裁决冲突会顺带自动解除；这个工具用于单独放行。
+    """
+    _ensure_db()
+    try:
+        memory_id = int(memory_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "message": "memory_id must be an integer"}
+    return gov.release_review_status(memory_id, reason=str(reason or ""),
+                                     approver=str(approver or "user"))
+
+
 # ==========================================================================
 # Phase 5.4 — autonomous maintenance loop (dry_run / review / apply_approved)
 # ==========================================================================

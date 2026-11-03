@@ -416,6 +416,15 @@ def api_set_review(memory_id: int, payload: dict):
                payload.get("approver", "admin-ui"))
 
 
+@app.post("/api/memories/{memory_id}/review/release")
+def api_release_review(memory_id: int, payload: dict):
+    """解除 pending_review —— 没有这个出口，被标记的记忆就再也检索不到。"""
+    payload = payload or {}
+    return _run(gov.release_review_status, memory_id,
+               payload.get("reason", "") or "",
+               payload.get("approver", "admin-ui"))
+
+
 @app.get("/api/memories/{memory_id}/governance")
 def api_gov_status(memory_id: int):
     return _run(gov.get_governance_status, memory_id)
