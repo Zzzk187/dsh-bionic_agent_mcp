@@ -6,7 +6,9 @@
 
 - 数据全部落在本地 SQLite（`data/agent.db`），无云端调用、无 API Key。
 - 向量模型用 FastEmbed / ONNX 本地推理，首次使用自动下载一次后离线可用。
-- 提供两个可分开挂载的 MCP 实例：**核心 21 工具**（日常）+ **治理 45 工具**（按需），同一个数据库、同一套后端，无重复逻辑。
+- 提供两个可分开挂载的 MCP 实例：**核心 31 工具**（日常）+ **治理 46 工具**（按需），同一个数据库、同一套后端，无重复逻辑。
+  - 核心多出的 7 个（`set_memory_expiry` / `scan_expired_memories` / `run_expiry_policy` / `get_resume_packet` / `find_stuck_tasks` / `fail_task` / `backfill_memory_types`）都是日常维护动作、参数很短，放核心才不会让常见操作被迫多挂一个实例。
+  - 另有 3 个知识库工具（`search_knowledge` / `get_knowledge_doc` / `knowledge_status`）同样放核心：`knowledge/` 与 `mine/` 的检索和记忆检索是同一个动作，不该分两次挂载。
 
 ---
 
@@ -510,7 +512,7 @@ B: DSH 桌面版每次重启端口都会变，这次是 51366
 |---|---|
 | `tests/smoke_test.py` | DB 迁移与记忆读写（离线，临时库） |
 | `tests/embedding_test.py` | 向量持久化兼容 |
-| `tests/verify_mcp_split_test.py` | 双实例工具注册验证（核心 21 + 治理 45 = 66） |
+| `tests/verify_mcp_split_test.py` | 双实例工具注册验证（核心 31 + 治理 46 = 77） |
 | `tests/concurrency_test.py` | 6 进程并发建库/写、跨进程持锁等待、busy_timeout 可配（8 项） |
 | `tests/feedback_loop_test.py` | 反馈闭环：retrieved 不计分、分层权重、±25% 上限、端到端分数真会动（26 项） |
 | `tests/snapshot_test.py` | 整库快照/恢复：sha256 校验、中途失败整库回滚、id 序列重置（31 项） |
@@ -521,7 +523,10 @@ B: DSH 桌面版每次重启端口都会变，这次是 51366
 | `tests/recall_profile_test.py` | 召回画像：权重不归零不主导、画像确实改变算分、类型乘子有界、写入自动归类（62 项） |
 | `tests/conflict_triage_test.py` | 取值冲突：同骨架不同数值不判重复、真重复仍抓得到、MCP 端到端（28 项） |
 | `tests/timeline_test.py` | 时间分档：路由不被 `/{id}` 抢先、未来时间归今天、认不出的计入 unparsed（12 项） |
-| `tests/views_test.py` | 分类/热度/时间轴：access_count 必须回填、热度按绝对值分档、召回与详情记账而列表不记（13 项） |
+| `tests/views_test.py` | 分类/热度/时间轴：access_count 必须回填、热度按绝对值分档、召回与详情记账而列表不记（18 项） |
+| `tests/review_release_test.py` | 待审核保留的进与出：被藏的真检索不到、裁决后回到检索、`pending` 不解除、幂等、可回滚（25 项） |
+| `tests/knowledge_test.py` | 知识库导入与检索：幂等重导入、删块连带删向量、按路径取文档时 chunks 不能空、38 条检索基准 recall@1/@3 全中（26 项） |
+| `tests/activation_test.py` | 激活扩散的种子来源：访问痕迹能当种子、usage 弱于显式激活、零命中查询里也生效、扩散是纯读（16 项） |
 
 示例用法：
 
