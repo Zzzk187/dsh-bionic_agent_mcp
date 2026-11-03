@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import time
 from pathlib import Path
 from contextlib import closing, contextmanager
 
@@ -17,14 +18,43 @@ DB_PATH = Path(
 # here and still far from "hang forever".
 BUSY_TIMEOUT_SECONDS = float(os.environ.get("BIONIC_DB_BUSY_TIMEOUT", "30"))
 
+
+def _retry_locked(fn, attempts: int = 40, delay: float = 0.05):
+    """Retry `fn` while SQLite says the database is locked.
+
+    `busy_timeout` covers statements that need the write lock, but it does NOT
+    cover switching the journal mode: `PRAGMA journal_mode=WAL` is a file-format
+    change that SQLite tries with a zero-length wait, so it fails instantly with
+    "database is locked" when another process happens to be holding the file at
+    that exact moment. Three of our processes (two MCP servers + the Web panel)
+    start at the same time, so this is a real startup race, not a test artifact:
+    with 6 processes initialising one empty file it reproduces in roughly one
+    attempt in three.
+
+    Retrying is safe because every caller here is idempotent DDL.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc).lower():
+                raise
+            last = exc
+            time.sleep(delay * (1 + i * 0.25))   # mild backoff, keep total small
+    raise last
+
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     # NOTE: `with sqlite3.connect(...)` only commits on exit, it never closes the
     # handle. On Windows that leaves the file locked, so database files cannot be
     # deleted or backed up afterwards. Use `closing()` + an explicit commit.
-    with closing(sqlite3.connect(DB_PATH)) as conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_SECONDS)) as conn:
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=%d" % int(BUSY_TIMEOUT_SECONDS * 1000))
+        # journal_mode is a file-format change and ignores busy_timeout, so it
+        # has to be retried explicitly; the schema below is idempotent DDL.
+        _retry_locked(lambda: conn.execute("PRAGMA journal_mode=WAL"))
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS memories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -353,7 +383,7 @@ def connect():
     conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=%d" % int(BUSY_TIMEOUT_SECONDS * 1000))
-    conn.execute("PRAGMA journal_mode=WAL")
+    _retry_locked(lambda: conn.execute("PRAGMA journal_mode=WAL"))
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     try:
@@ -374,7 +404,7 @@ def transaction():
     conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=%d" % int(BUSY_TIMEOUT_SECONDS * 1000))
-    conn.execute("PRAGMA journal_mode=WAL")
+    _retry_locked(lambda: conn.execute("PRAGMA journal_mode=WAL"))
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     # IMMEDIATE takes the write lock up front. With the default deferred BEGIN a
