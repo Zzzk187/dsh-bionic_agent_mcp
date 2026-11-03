@@ -521,7 +521,7 @@ B: DSH 桌面版每次重启端口都会变，这次是 51366
 | `tests/task_resume_test.py` | 任务续跑：无快照必须诚实说带不了、不虚报 plan 进度、retry_count 持久化（42 项） |
 | `tests/expiry_test.py` | 有效期：临时类可设/长期类拒绝、过期降权不删除、24h 宽限、dry_run 不改数据（37 项） |
 | `tests/recall_profile_test.py` | 召回画像：权重不归零不主导、画像确实改变算分、类型乘子有界、写入自动归类（62 项） |
-| `tests/conflict_triage_test.py` | 取值冲突：同骨架不同数值不判重复、真重复仍抓得到、MCP 端到端（28 项） |
+| `tests/conflict_triage_test.py` | 取值冲突：同骨架不同数值不判重复、真重复仍抓得到、已裁决的对不再复活、MCP 端到端（33 项） |
 | `tests/timeline_test.py` | 时间分档：路由不被 `/{id}` 抢先、未来时间归今天、认不出的计入 unparsed（12 项） |
 | `tests/views_test.py` | 分类/热度/时间轴：access_count 必须回填、热度按绝对值分档、召回与详情记账而列表不记（18 项） |
 | `tests/review_release_test.py` | 待审核保留的进与出：被藏的真检索不到、裁决后回到检索、`pending` 不解除、幂等、可回滚（25 项） |
