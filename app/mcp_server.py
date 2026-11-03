@@ -24,6 +24,7 @@ from app import snapshots
 from app import protection
 from app import distillation
 from app import activation_spreading as spreading
+from app import knowledge
 
 # Two FastMCP instances share the same process/module state but are launched as
 # separate MCP servers so the host can mount only the lightweight core instance
@@ -1241,6 +1242,41 @@ def backfill_memory_types(dry_run: bool = True, limit: int = 500) -> dict:
         "note": ("干跑：只报告不落库" if dry_run
                  else "已写回；召回排序会随之变化，但没有任何记忆被删除或隐藏"),
     }
+
+
+@mcp.tool()
+def search_knowledge(query: str, limit: int = 5, root: str = "", domain: str = "") -> dict:
+    """在知识库里检索（knowledge/ 与 mine/ 的全文分块，语义 + 关键词混合）。
+
+    `root` 可填 knowledge 或 mine 只看一侧；`domain` 按知识域过滤（Agent /
+    产品 / 工程 / 语音 / 部署 / 安全 / 知识）。
+    """
+    _ensure_db()
+    limit = max(1, min(int(limit), 20))
+    return knowledge.search(query, limit=limit, root=root or "", domain=domain or "")
+
+
+@mcp.tool()
+def get_knowledge_doc(doc_id: int = 0, path: str = "", max_chars: int = 12000) -> dict:
+    """按 id 或相对路径取一篇知识笔记的全文（可截断）。
+
+    检索命中只给摘要行时，想看上下文用这个；`path` 用检索结果里的 rel_path。
+    """
+    _ensure_db()
+    max_chars = max(500, min(int(max_chars), 60000))
+    if not doc_id and not path:
+        return {"ok": False, "error": "doc_id 与 path 至少给一个"}
+    return knowledge.get_doc(doc_id=doc_id, path=path or "", max_chars=max_chars)
+
+
+@mcp.tool()
+def knowledge_status() -> dict:
+    """知识库索引概况：文档数 / 分块数 / 向量覆盖 / 各知识域分布。
+
+    回答「知识库导进来了没有、向量建全了没有」时先看这个，不要靠猜。
+    """
+    _ensure_db()
+    return knowledge.status()
 
 
 @mcp_gov.tool()

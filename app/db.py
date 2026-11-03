@@ -138,6 +138,8 @@ def init_db():
         _migrate_phase5(conn)
         # ---- Phase 6: lifecycle types, feedback & consolidation candidates ----
         _migrate_phase6(conn)
+        # ---- Phase 7: read-only knowledge base (dsh-memory knowledge/ + mine/) ----
+        _migrate_phase7(conn)
         conn.commit()
 
 
@@ -356,12 +358,83 @@ def _migrate_phase6(conn) -> dict:
     return {"applied_columns": applied}
 
 
+def _migrate_phase7(conn) -> dict:
+    """Idempotent Phase-7 migration: the read-only knowledge base.
+
+    Why this exists: `knowledge/` (82 md, 400K chars) and `mine/` (24 md) in
+    dsh-memory were never reachable from MCP -- there was no table to hold them,
+    so semantic search over "what have I learned" only ever covered the 36
+    memory rows. This migration adds the two tables that make them searchable.
+
+    Why two tables and not one: a document is the unit a human cites
+    ("knowledge/语音/2026-10-20-本地TTS与声音克隆.md"), but a whole document is
+    a bad embedding unit (median 10K chars, max 20K). Chunks are what get
+    embedded and scored; the doc table holds title/path/mtime for display and
+    for deciding whether a re-import is needed at all.
+
+    Never touches `memories`: these are documents, not facts. They have no
+    lifecycle, no governance, no conflict detection -- and they must not, or a
+    82-doc import would flood the conflict/review queue.
+
+    Safe to run on every startup and repeatedly; nothing is dropped or rewritten.
+    """
+    conn.execute("""CREATE TABLE IF NOT EXISTS knowledge_docs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT NOT NULL UNIQUE,          -- absolute source path, the idempotency anchor
+        rel_path TEXT NOT NULL DEFAULT '',  -- path relative to its root, for display
+        root TEXT NOT NULL DEFAULT '',      -- 'knowledge' | 'mine'
+        domain TEXT NOT NULL DEFAULT '',    -- knowledge/ subdir, e.g. '语音' ('' for mine)
+        title TEXT NOT NULL DEFAULT '',
+        content TEXT NOT NULL,              -- full markdown, kept so a chunk can be re-read in context
+        content_hash TEXT NOT NULL,         -- sha256 of content; unchanged hash = skip re-import
+        byte_size INTEGER NOT NULL DEFAULT 0,
+        mtime INTEGER NOT NULL DEFAULT 0,
+        chunk_count INTEGER NOT NULL DEFAULT 0,
+        imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # Ord is the section's position in the document. Without it a chunk list is
+    # just a bag of text and "show me the section before this one" is impossible.
+    conn.execute("""CREATE TABLE IF NOT EXISTS knowledge_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_id INTEGER NOT NULL,
+        ord INTEGER NOT NULL DEFAULT 0,
+        heading TEXT NOT NULL DEFAULT '',
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        char_count INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(doc_id) REFERENCES knowledge_docs(id) ON DELETE CASCADE
+    )""")
+
+    # Vectors live here rather than on knowledge_chunks so a document edit can
+    # drop its vectors with a plain DELETE ... WHERE chunk_id IN (...) and the
+    # chunk text stays intact for display in the meantime.
+    conn.execute("""CREATE TABLE IF NOT EXISTS knowledge_embeddings (
+        chunk_id INTEGER PRIMARY KEY,
+        model_name TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        dimension INTEGER NOT NULL,
+        vector_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(chunk_id) REFERENCES knowledge_chunks(id) ON DELETE CASCADE
+    )""")
+
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_chunks_doc_ord ON knowledge_chunks(doc_id, ord)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_docs_root ON knowledge_docs(root, domain)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_doc ON knowledge_chunks(doc_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_embeddings_model ON knowledge_embeddings(model_name)")
+    return {"phase": 7}
+
+
 def init_db_phase5() -> dict:
     """Run the Phase-5 migration on the real database. Idempotent."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(DB_PATH)) as conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_SECONDS)) as conn:
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=%d" % int(BUSY_TIMEOUT_SECONDS * 1000))
+        _retry_locked(lambda: conn.execute("PRAGMA journal_mode=WAL"))
         result = _migrate_phase5(conn)
         conn.commit()
         return result
