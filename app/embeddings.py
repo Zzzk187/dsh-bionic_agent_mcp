@@ -9,6 +9,19 @@ DEFAULT_MODEL = os.getenv(
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
 )
 
+# 模型缓存目录：默认放在项目 data/model_cache，而不是 fastembed 的
+# %TEMP%/fastembed_cache —— 后者会被 Windows 清理临时文件时删掉，导致
+# 每次冷启动重下 241MB（且直连 huggingface.co 会超时）。
+# 可用 BIONIC_EMBEDDING_CACHE 覆盖。
+CACHE_DIR = os.getenv(
+    "BIONIC_EMBEDDING_CACHE",
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "data",
+        "model_cache",
+    ),
+)
+
 # multilingual-e5* 系模型训练时带任务前缀，其他（如 paraphrase-*）不需要；
 # 加错前缀会明显掉点，所以按模型名判断。
 PREFIXED_MODELS = ("multilingual-e5",)
@@ -52,10 +65,11 @@ def _build(model_name: str):
             "缺少 fastembed 依赖。请在项目目录执行：python -m pip install -r requirements.txt"
         ) from exc
     try:
-        return TextEmbedding(model_name=model_name)
+        return TextEmbedding(model_name=model_name, cache_dir=CACHE_DIR)
     except Exception as exc:
         raise EmbeddingUnavailable(
-            f"Embedding 模型初始化失败：{exc}. 首次运行需要联网下载模型；请检查网络/代理后重试。"
+            f"Embedding 模型初始化失败：{exc}. 首次运行需要联网下载模型；"
+            "国内网络请设 HF_ENDPOINT=https://hf-mirror.com 后重试。"
         ) from exc
 
 
