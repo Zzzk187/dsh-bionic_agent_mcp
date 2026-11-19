@@ -29,9 +29,9 @@ from app import knowledge
 # Two FastMCP instances share the same process/module state but are launched as
 # separate MCP servers so the host can mount only the lightweight core instance
 # for daily use and attach the heavier governance instance on demand. This keeps
-# the per-session fixed tool-list token cost down (core = 21 legacy tools only).
+# the per-session fixed tool-list token cost down (core = 36 tools).
 # Both import the identical app.* backend, so there is no duplicated logic.
-mcp = FastMCP("bionic-agent")                 # core: the 21 legacy Phase 1-4 tools
+mcp = FastMCP("bionic-agent")                 # core: 36 tools (daily + export/validate/memory packages)
 mcp_gov = FastMCP("bionic-agent-governance")  # governance / lifecycle / Phase 8 tools
 
 # Preload the embedding model in the background at server startup so the first
@@ -217,6 +217,11 @@ def search_memories(query: str = "", limit: int = 20, category: str = "", includ
     if category.strip():
         clauses.append("category = ?")
         params.append(category.strip()[:100])
+    # 不含 AND 词条件、不含 LIMIT 的那份条件与参数，给下面的词法兜底复用。
+    # 手写而不是从 params 反推：反推漏掉 LIMIT 那个 ? 就会报
+    # "sqlite3.ProgrammingError: Incorrect number of bindings"。
+    base_clauses = list(clauses)
+    base_params = list(params)
     query = query.strip()
     if query:
         terms = [t for t in re.split(r"\s+", query) if t][:8]
@@ -228,7 +233,30 @@ def search_memories(query: str = "", limit: int = 20, category: str = "", includ
     params.append(limit)
     with connect() as conn:
         rows = conn.execute(sql, params).fetchall()
-    return [_memory_out(r) for r in rows]
+    if rows or not query:
+        return [_memory_out(r) for r in rows]
+
+    # AND 全不中。这不一定是"没有相关内容"——中文口语长句只要有一个词在库里
+    # 不存在，整条 SQL 就返回 0 行，调用方无法区分"真的没有"和"有一个词没对
+    # 上"。退回字段加权词法打分（标题×6 / 标签×4 / 正文×2 + bigram/trigram
+    # 展开 + 同义词），让部分命中也能排出来。
+    # 结果带 fuzzy=True 与 score：这是放宽后的排序，不是精确命中。
+    from app import memory_lexical
+    fsql = ("SELECT * FROM memories WHERE " + " AND ".join(base_clauses)
+            + " ORDER BY updated_at DESC, id DESC")
+    with connect() as conn:
+        allrows = conn.execute(fsql, base_params).fetchall()
+    scored = memory_lexical.score_all(query, [dict(r) for r in allrows])
+    if not scored:
+        return []
+    by_id = {r["id"]: r for r in allrows}
+    out = []
+    for rid, score in sorted(scored.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]:
+        item = _memory_out(by_id[rid])
+        item["score"] = round(float(score), 4)
+        item["fuzzy"] = True
+        out.append(item)
+    return out
 
 @mcp.tool()
 def find_related_memories(query: str, limit: int = 10, category: str = "") -> list[dict]:
@@ -1092,8 +1120,14 @@ def get_vector_consistency() -> dict:
 @mcp_gov.tool()
 def recall_memories(query: str = "", top_k: int = 5, category: str = "",
                     memory_type: str = "", include_related: bool = False,
-                    explain: bool = False) -> dict:
-    """融合语义+关键词+治理分的可解释检索；含关联子图与激活扩散；稳定排序。"""
+                    explain: bool = False, min_score: float | None = None) -> dict:
+    """融合语义+关键词+治理分的可解释检索；含关联子图与激活扩散；稳定排序。
+
+    `min_score` 是**默认关闭**的相关性门槛：本次实测（45 题）证明固定分数阈值
+    无法区分相关与无关查询（相关题 top1 最低 0.3707 比 3 道无关题都低），因此
+    不设默认值。调用方显式给出时，若全部候选低于门槛则返回空列表并附
+    `rejected` 说明，绝不把低分结果包装成有效记忆。
+    """
     _ensure_db()
     if not isinstance(top_k, int):
         try:
@@ -1108,9 +1142,23 @@ def recall_memories(query: str = "", top_k: int = 5, category: str = "",
     with connect() as conn:
         rows = life.recall_memories(
             query=query, top_k=top_k, category=category, memory_type=memory_type,
-            include_related=include_related, explain=explain, conn=conn)
-    result = {"results": rows, "count": len(rows),
+            include_related=include_related, explain=explain, conn=conn,
+            min_score=min_score)
+    # A rejection is not a memory: pull it out so `results` only ever contains
+    # real rows. `count == 0` plus `rejected` is the explicit "nothing relevant"
+    # answer, never a short-but-nonempty list.
+    rejected = None
+    real = []
+    for r in rows:
+        if isinstance(r, dict) and r.get("_rejected"):
+            rejected = r["_rejected"]
+        else:
+            real.append(r)
+    result = {"results": real, "count": len(real),
               "weights": life.RECALL_WEIGHTS if explain else None}
+    if rejected is not None:
+        result["rejected"] = rejected
+        result["empty"] = True
     # Surface whether semantic relevance was actually applied (vs keyword-only
     # degradation while the model is loading) so the caller can decide to retry.
     if query.strip() and not model_ready:
@@ -1246,10 +1294,14 @@ def backfill_memory_types(dry_run: bool = True, limit: int = 500) -> dict:
 
 @mcp.tool()
 def search_knowledge(query: str, limit: int = 5, root: str = "", domain: str = "") -> dict:
-    """在知识库里检索（knowledge/ 与 mine/ 的全文分块，语义 + 关键词混合）。
+    """在知识库里检索（全文分块，关键词主导 + 向量补漏）。
 
-    `root` 可填 knowledge 或 mine 只看一侧；`domain` 按知识域过滤（Agent /
-    产品 / 工程 / 语音 / 部署 / 安全 / 知识）。
+    `root` 可填 knowledge / mine / memory / script 只看一侧：
+      * knowledge / mine —— 知识笔记
+      * memory  —— 系统骨架（AGENTS.md、约定、性格、体系、记忆目录、卷/）
+      * script  —— 10 个 .ps1 工具脚本
+    `domain` 按知识域过滤（Agent / 产品 / 工程 / 语音 / 部署 / 安全 / 知识）。
+    想一次同时查记忆，用 recall_all。
     """
     _ensure_db()
     limit = max(1, min(int(limit), 20))
@@ -1277,6 +1329,65 @@ def knowledge_status() -> dict:
     """
     _ensure_db()
     return knowledge.status()
+
+
+@mcp.tool()
+def recall_all(query: str, limit: int = 5, memory_limit: int = 0,
+               knowledge_limit: int = 0, root: str = "",
+               include_knowledge: bool = True) -> dict:
+    """统一检索：一句话同时查记忆与知识（本地 dsh-memory 融入 MCP 的接缝）。
+
+    这是 scripts/recall.py 的 MCP 版本。两个库都是"关键词主导 + 向量补漏"，
+    所以同一句话不会在两边被排成两套逻辑；这里把两边结果放进同一个返回体，
+    调用方拿到的是"关于这个问题，系统一共有哪些东西"。
+
+    - 记忆走 recall_memories（词法 0.43 + 语义 0.12 融合，含治理分）
+    - 知识走 knowledge.search（关键词主导，向量过地板才加分）
+
+    `root` 只作用于知识侧：knowledge / mine / memory / script。
+    传 "" 表示全部。想只看骨架（约定、性格、体系、卷/、脚本）传 memory 或 script。
+    """
+    _ensure_db()
+    query = (query or "").strip()
+    if not query:
+        return {"ok": False, "error": "query 不能为空", "memories": [], "knowledge": []}
+    limit = max(1, min(int(limit), 20))
+    mem_lim = max(1, min(int(memory_limit or limit), 20))
+    kn_lim = max(1, min(int(knowledge_limit or limit), 20))
+
+    from app.memory_lifecycle import recall_memories as _recall
+
+    memories = _recall(query, top_k=mem_lim)
+    out_mem = []
+    for m in memories:
+        anchor = next((str(t)[4:] for t in (m.get("tags") or [])
+                       if str(t).startswith("src:")), str(m.get("id")))
+        content = m.get("content") or ""
+        head, _, body_text = content.partition("\n")
+        out_mem.append({
+            "anchor": anchor,
+            "id": m.get("id"),
+            "title": head.lstrip("#").strip() or "(无标题)",
+            "body": body_text.strip()[:600],
+            "tags": [str(t) for t in (m.get("tags") or []) if not str(t).startswith("src:")],
+            "score": round(float(m.get("_score") or 0.0), 4),
+        })
+
+    out_kn: list[dict] = []
+    if include_knowledge:
+        res = knowledge.search(query, limit=kn_lim, root=root or "")
+        for it in (res.get("results") or []):
+            out_kn.append({
+                "doc_id": it.get("doc_id"),
+                "root": it.get("root"),
+                "path": it.get("source") or it.get("rel_path") or "",
+                "heading": it.get("heading") or "",
+                "snippet": (it.get("snippet") or "").strip()[:400],
+                "score": round(float(it.get("score") or 0.0), 4),
+            })
+
+    return {"ok": True, "query": query, "memories": out_mem, "knowledge": out_kn,
+            "counts": {"memories": len(out_mem), "knowledge": len(out_kn)}}
 
 
 @mcp_gov.tool()
@@ -1416,6 +1527,201 @@ def record_memory_activation(memory_id: int, reason: str = "", approver: str = "
 
 
 
+# ==========================================================================
+# S3 — Portable Restore MCP tools (thin wrappers over S1/S2).
+# 设计红线：只接受 package_id + 固定受管目录；不暴露任何自由文件路径，
+# 不在 MCP 层重复实现 ZIP 校验 / 恢复 / 回滚 / 令牌逻辑；全部转调现有 API。
+# ==========================================================================
+from app import portable_backup as _pbackup      # noqa: E402
+from app import portable_restore as _prestore    # noqa: E402
+
+
+def _pkg_path(package_id: str):
+    """package_id → 受管包路径；非法 id 一律拒绝，绝不解析自由路径。"""
+    pid = str(package_id or "").strip()
+    if (not pid or pid in (".", "..") or "/" in pid or "\\" in pid
+            or re.match(r"^[A-Za-z]:", pid) or ".." in pid
+            or not pid.startswith("bionic-memory-")):
+        return None, "非法 package_id（必须是受管包 stem，形如 bionic-memory-...）"
+    try:
+        pdir = _pbackup._resolve_package_dir().resolve()
+    except ValueError as exc:
+        return None, str(exc)
+    target = (pdir / (pid + ".zip")).resolve()
+    try:
+        target.relative_to(pdir)
+    except ValueError:
+        return None, "包路径越出受管目录"
+    return str(target), None
+
+
+def _tool_result(operation: str, inner: dict, *, restore_id=None) -> dict:
+    """MCP 边界轻量适配：底层返回原样放 result，外层附统一外壳。"""
+    ok = bool(inner.get("ok"))
+    errors = list(inner.get("errors") or [])
+    if not ok and not errors and inner.get("message"):
+        errors = [str(inner["message"])]
+    out = {
+        "ok": ok, "operation": operation, "result": inner,
+        "warnings": list(inner.get("warnings") or []), "errors": errors,
+    }
+    if restore_id is not None:
+        out["restore_id"] = restore_id
+    status = inner.get("status") or inner.get("state")
+    if status:
+        out["status"] = status
+    return out
+
+
+def _tool_error(operation: str, message) -> dict:
+    return {"ok": False, "operation": operation, "result": {},
+            "warnings": [], "errors": [str(message)]}
+
+
+# --- core（4 个：包导出 / 列表 / 查看 / 校验，其中三个只读）---
+
+@mcp.tool()
+def export_memory_package(backup_type: str = "source_only") -> dict:
+    """按四模式导出一个便携记忆包到受管目录：source_only / source_with_db / full / knowledge_tasks。"""
+    op = "export_memory_package"
+    bt = str(backup_type or "").strip()
+    if bt not in _pbackup.BACKUP_TYPES:
+        return _tool_error(op, f"非法导出模式：{backup_type or '(空)'}（可选：{', '.join(_pbackup.BACKUP_TYPES)}）")
+    try:
+        return _tool_result(op, _pbackup.export_portable(bt))
+    except Exception as exc:  # noqa: BLE001 — MCP 边界统一转结构化错误
+        return _tool_error(op, f"导出异常：{type(exc).__name__}: {exc}")
+
+
+@mcp.tool()
+def list_memory_packages() -> dict:
+    """列出受管目录中已有的便携记忆包（只读；只看文件名/大小/时间）。"""
+    op = "list_memory_packages"
+    try:
+        return _tool_result(op, _pbackup.list_packages())
+    except Exception as exc:  # noqa: BLE001
+        return _tool_error(op, f"列包异常：{type(exc).__name__}: {exc}")
+
+
+@mcp.tool()
+def inspect_memory_package(package_id: str, expected_type: str = "") -> dict:
+    """只读查看一个便携包的 manifest 摘要与校验结果。"""
+    op = "inspect_memory_package"
+    path, err = _pkg_path(package_id)
+    if err:
+        return _tool_error(op, err)
+    et = str(expected_type or "").strip() or None
+    try:
+        return _tool_result(op, _pbackup.inspect_package(path, expected_type=et))
+    except Exception as exc:  # noqa: BLE001
+        return _tool_error(op, f"查看异常：{type(exc).__name__}: {exc}")
+
+
+@mcp.tool()
+def validate_memory_package(package_id: str, expected_type: str = "") -> dict:
+    """对一个便携包执行 14 项安全与完整性校验（只读，不解包到正式目录）。"""
+    op = "validate_memory_package"
+    path, err = _pkg_path(package_id)
+    if err:
+        return _tool_error(op, err)
+    et = str(expected_type or "").strip() or None
+    try:
+        return _tool_result(op, _pbackup.validate_package_archive(path, expected_type=et))
+    except Exception as exc:  # noqa: BLE001
+        return _tool_error(op, f"校验异常：{type(exc).__name__}: {exc}")
+
+
+# --- governance（3 个：预览 / 执行恢复 / 删包）---
+
+@mcp_gov.tool()
+def preview_memory_restore(package_id: str, restore_mode: str = "merge",
+                           conflict_policy: str = "keep_target",
+                           delete_extras: bool = False, ttl_sec: int = 300) -> dict:
+    """只读预览恢复：真实差异统计 + 冲突/删除项 + compatibility + 一次性确认令牌。"""
+    op = "preview_memory_restore"
+    path, err = _pkg_path(package_id)
+    if err:
+        return _tool_error(op, err)
+    rm = str(restore_mode or "").strip()
+    cp = str(conflict_policy or "").strip()
+    if rm not in _prestore.RESTORE_MODES:
+        return _tool_error(op, f"非法恢复模式：{restore_mode or '(空)'}")
+    if cp not in _prestore.CONFLICT_POLICIES:
+        return _tool_error(op, f"非法冲突策略：{conflict_policy or '(空)'}")
+    try:
+        ttl = int(ttl_sec)
+    except (TypeError, ValueError):
+        return _tool_error(op, "ttl_sec 必须是整数")
+    if not (1 <= ttl <= 86400):
+        return _tool_error(op, "ttl_sec 必须在 1..86400 之间")
+    try:
+        inner = _prestore.preview_restore(
+            path, restore_mode=rm, conflict_policy=cp,
+            delete_extras=bool(delete_extras), ttl_sec=ttl)
+        out = _tool_result(op, inner, restore_id=inner.get("restore_id"))
+        if inner.get("blockers"):
+            out["blockers"] = list(inner["blockers"])
+        return out
+    except Exception as exc:  # noqa: BLE001
+        return _tool_error(op, f"预览异常：{type(exc).__name__}: {exc}")
+
+
+@mcp_gov.tool()
+def restore_memory_package(restore_id: str, confirmation_token: str, package_id: str,
+                           restore_mode: str = "merge",
+                           conflict_policy: str = "keep_target",
+                           delete_extras: bool = False) -> dict:
+    """执行恢复：必须显式传预览生成的 restore_id 与一次性令牌，先确认后执行；工具绝不自行生成令牌。"""
+    op = "restore_memory_package"
+    rid = str(restore_id or "").strip()
+    tok = str(confirmation_token or "").strip()
+    if not rid:
+        return _tool_error(op, "缺少 restore_id（请先调用 preview_memory_restore）")
+    if not tok:
+        return _tool_error(op, "缺少 confirmation_token（禁止跳过确认；请先预览）")
+    path, err = _pkg_path(package_id)
+    if err:
+        return _tool_error(op, err)
+    rm = str(restore_mode or "").strip()
+    cp = str(conflict_policy or "").strip()
+    if rm not in _prestore.RESTORE_MODES:
+        return _tool_error(op, f"非法恢复模式：{restore_mode or '(空)'}")
+    if cp not in _prestore.CONFLICT_POLICIES:
+        return _tool_error(op, f"非法冲突策略：{conflict_policy or '(空)'}")
+    try:
+        # 第一步：显式确认（S2 内部重算绑定指纹 + 一次性消费令牌）
+        cf = _prestore.confirm_restore(
+            rid, tok, package_path=path, restore_mode=rm,
+            conflict_policy=cp, delete_extras=bool(delete_extras))
+        if not cf.get("ok"):
+            out = _tool_result(op, cf, restore_id=rid)
+            out["stage"] = "confirm"
+            return out
+        # 第二步：执行（令牌已消费；S2 内部再次比对确认时指纹；不传 fail_inject）
+        ex = _prestore.execute_restore(
+            rid, tok, package_path=path, restore_mode=rm,
+            conflict_policy=cp, delete_extras=bool(delete_extras))
+        out = _tool_result(op, ex, restore_id=rid)
+        out["stage"] = "execute"
+        out["confirmation"] = cf
+        return out
+    except Exception as exc:  # noqa: BLE001
+        return _tool_error(op, f"恢复异常：{type(exc).__name__}: {exc}")
+
+
+@mcp_gov.tool()
+def delete_memory_package(package_id: str) -> dict:
+    """删除一个受管便携包（只删 data/memory_packages 内的包，不删保护性备份与 staging）。"""
+    op = "delete_memory_package"
+    pid = str(package_id or "").strip()
+    if not pid:
+        return _tool_error(op, "缺少 package_id")
+    try:
+        return _tool_result(op, _pbackup.delete_package(pid))
+    except Exception as exc:  # noqa: BLE001
+        return _tool_error(op, f"删除异常：{type(exc).__name__}: {exc}")
+
+
 def _run(server, transport):
     _ensure_db()
     server.run(transport=transport)
@@ -1427,6 +1733,6 @@ def _run_cli():
 
 
 if __name__ == "__main__":
-    # Default launch = core instance (21 legacy tools). Launch the governance
+    # Default launch = core instance (36 tools). Launch the governance
     # instance with: python -m app.mcp_server_gov
     _run_cli()

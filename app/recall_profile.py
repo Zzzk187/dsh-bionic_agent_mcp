@@ -46,21 +46,21 @@ _SHAPE_PATTERNS = (
 # * reflection memories are distilled conclusions; they should win on
 #   importance/confidence, not on how often they were returned.
 TYPE_PROFILES = {
-    "preference": {"semantic": 0.42, "keyword": 0.20, "importance": 0.18,
-                   "confidence": 0.10, "freshness": 0.03, "frequency": 0.04,
-                   "activation": 0.03},
-    "procedural": {"semantic": 0.36, "keyword": 0.18, "importance": 0.14,
-                   "confidence": 0.16, "freshness": 0.04, "frequency": 0.07,
-                   "activation": 0.05},
-    "episodic": {"semantic": 0.34, "keyword": 0.16, "importance": 0.10,
-                 "confidence": 0.08, "freshness": 0.16, "frequency": 0.07,
-                 "activation": 0.09},
-    "reflection": {"semantic": 0.36, "keyword": 0.15, "importance": 0.22,
-                   "confidence": 0.14, "freshness": 0.05, "frequency": 0.04,
-                   "activation": 0.04},
-    "goal": {"semantic": 0.36, "keyword": 0.17, "importance": 0.18,
-             "confidence": 0.10, "freshness": 0.09, "frequency": 0.05,
-             "activation": 0.05},
+    "preference": {"semantic": 0.423, "keyword": 0.202, "importance": 0.182,
+                   "confidence": 0.101, "freshness": 0.020, "frequency": 0.040,
+                   "activation": 0.032},
+    "episodic": {"semantic": 0.24, "keyword": 0.18,
+                 "importance": 0.12, "confidence": 0.16, "freshness": 0.19,
+                 "frequency": 0.06, "activation": 0.05},
+    "procedural": {"semantic": 0.30, "keyword": 0.34, "importance": 0.13,
+                   "confidence": 0.08, "freshness": 0.02, "frequency": 0.07,
+                   "activation": 0.06},
+    "goal": {"semantic": 0.26, "keyword": 0.22, "importance": 0.20,
+             "confidence": 0.14, "freshness": 0.09, "frequency": 0.05,
+             "activation": 0.04},
+    "reflection": {"semantic": 0.28, "keyword": 0.20, "importance": 0.18,
+                   "confidence": 0.10, "freshness": 0.11, "frequency": 0.07,
+                   "activation": 0.06},
 }
 
 # A query shaped like a "how do I" question prefers procedural knowledge even

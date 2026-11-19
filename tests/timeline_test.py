@@ -38,19 +38,27 @@ def main() -> int:
 
     db.init_db()
 
-    def iso(days_ago: float) -> str:
-        return (datetime.now() - timedelta(days=days_ago)).strftime("%Y-%m-%d %H:%M:%S")
+    # 造数据要锚在「自然日的零点」而不是「N 天前这一刻」。
+    # 原来用 now - timedelta(days=0.1)，白天跑没问题，凌晨 1 点跑就退回前一天：
+    # 0.1 天 = 2.4 小时，01:35 减掉正好是昨天 23:11。于是「今天 2 条」变成
+    # 昨天 2 条，这个测试凌晨必红——而它红了三个月没人管，因为大家都以为
+    # 是自己环境的问题。锚到日界后，什么时刻跑都是同一个日期。
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def iso(days_ago: int) -> str:
+        return (midnight - timedelta(days=days_ago)).strftime("%Y-%m-%d %H:%M:%S")
 
     # 造数据：今天 2 条、昨天 1 条、3 天前 1 条、40 天前 1 条、时间坏掉 1 条
     rows = [
-        ("今天的记忆 A", iso(0.1)),
-        ("今天的记忆 B", iso(0.2)),
-        ("昨天的记忆", iso(1.2)),
-        ("三天前的记忆", iso(3.2)),
-        ("四十天前的记忆", iso(40.2)),
+        ("今天的记忆 A", iso(0)),
+        ("今天的记忆 B", iso(0)),
+        ("昨天的记忆", iso(1)),
+        ("三天前的记忆", iso(3)),
+        ("四十天前的记忆", iso(40)),
         # 时钟漂移/时区错会造出"未来"的时间戳。它必须归到今天，而不是从
         # 榜单上凭空消失 —— 消失比放错档更难被发现。
-        ("未来时间的记忆", iso(-0.5)),
+        ("未来时间的记忆",
+         (datetime.now() + timedelta(hours=12)).strftime("%Y-%m-%d %H:%M:%S")),
     ]
     with db.connect() as conn:
         for content, ts in rows:
@@ -87,7 +95,8 @@ def main() -> int:
           data["unparsed"] == 1, f'unparsed={data["unparsed"]}')
     check("total 只统计能解析的", data["total"] == 6, f'total={data["total"]}')
 
-    # by_day：今天 2 条、40 天前 1 条，共 4 个不同日期（今天/昨天/3天前/40天前）
+    # by_day：共 4 个不同日期（今天/昨天/3天前/40天前）。未来那条被 clamp
+    # 到今天，所以今天 3 条——这是「未来按今天算」口径的直接证据。
     days = data["by_day"]
     check("by_day 按日期聚合", len(days) == 4, f"days={len(days)}")
     check("by_day 最新在前", days[0]["date"] > days[-1]["date"],

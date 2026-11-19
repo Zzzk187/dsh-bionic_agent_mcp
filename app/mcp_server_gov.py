@@ -3,8 +3,8 @@
 This module imports the shared ``app.mcp_server`` module, which now defines two
 FastMCP instances:
 
-* ``mcp``     — the 21 legacy Phase 1-4 "core" tools.
-* ``mcp_gov`` — the 33 governance / lifecycle / embedding-timeout tools.
+* ``mcp``     — the 36 "core" tools (daily + export/validate + memory packages).
+* ``mcp_gov`` — the 49 governance / lifecycle / restore tools.
 
 Launching this entry point serves only ``mcp_gov`` over stdio, so the host can
 mount the lightweight core server for daily use and attach this governance

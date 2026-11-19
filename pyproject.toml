@@ -18,7 +18,12 @@ build-backend = "setuptools.build_meta"
 packages = ["app"]
 
 [tool.setuptools.package-data]
-app = ["py.typed", "admin_ui.html"]
+# S6-FINAL-FIX P1-2：`static/*` 是星图用的 3d-force-graph（1.39 MB，自包含
+# three.js）。`app/admin_ui.html:695` 通过 `/static/3d-force-graph.min.js`
+# 加载它、`app/admin_ui.py:1378` 的 STATIC_DIR 也指向 `app/static/`；漏掉就
+# 会让 pip 装出来的包打开星图 404（build_zip.py 打的 zip 里是有的，两条分发
+# 路径不一致）。`py.typed` 目前没有实体文件，声明保留无害。
+app = ["py.typed", "admin_ui.html", "static/*"]
 
 [project.scripts]
 bionic-agent = "app.mcp_server:_run_cli"

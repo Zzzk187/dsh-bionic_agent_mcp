@@ -39,7 +39,23 @@ def main() -> int:
     ap.add_argument("--status", action="store_true", help="只看索引概况")
     args = ap.parse_args()
 
-    db.init_db()
+    # [S0/P2-1] --dry-run / --status 只读：不建库、不执行任何 DDL。
+    # 表不存在时下游查询返回空结果，不会凭空造出一个 agent.db。
+    if not args.dry_run and not args.status:
+        db.init_db()
+
+    # [S0/P2-1] 库文件根本不存在时，--dry-run / --status 连连接都不开：
+    # sqlite3.connect 对不存在的路径会创建空文件，仍算"凭空建库"。
+    db_absent = not Path(db.DB_PATH).is_file()
+    if db_absent and args.status:
+        print(json.dumps({"ok": True, "status": "db_absent", "docs": 0},
+                         ensure_ascii=False, indent=2))
+        return 0
+    if db_absent and args.dry_run:
+        docs = knowledge.discover(args.root or None)
+        print(json.dumps({"ok": True, "dry_run": True, "db_absent": True,
+                          "docs_seen": len(docs)}, ensure_ascii=False, indent=2))
+        return 0
 
     if args.status:
         print(json.dumps(knowledge.status(), ensure_ascii=False, indent=2))

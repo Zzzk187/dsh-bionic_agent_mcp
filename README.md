@@ -6,7 +6,7 @@
 
 - 数据全部落在本地 SQLite（`data/agent.db`），无云端调用、无 API Key。
 - 向量模型用 FastEmbed / ONNX 本地推理，首次使用自动下载一次后离线可用。
-- 提供两个可分开挂载的 MCP 实例：**核心 31 工具**（日常）+ **治理 46 工具**（按需），同一个数据库、同一套后端，无重复逻辑。
+- 提供两个可分开挂载的 MCP 实例：**核心 36 工具**（日常）+ **治理 49 工具**（按需），同一个数据库、同一套后端，无重复逻辑。
   - 核心多出的 7 个（`set_memory_expiry` / `scan_expired_memories` / `run_expiry_policy` / `get_resume_packet` / `find_stuck_tasks` / `fail_task` / `backfill_memory_types`）都是日常维护动作、参数很短，放核心才不会让常见操作被迫多挂一个实例。
   - 另有 3 个知识库工具（`search_knowledge` / `get_knowledge_doc` / `knowledge_status`）同样放核心：`knowledge/` 与 `mine/` 的检索和记忆检索是同一个动作，不该分两次挂载。
 
@@ -20,7 +20,7 @@
 | 检索 | `search_memories`（关键词）/ `find_related_memories`（关联）/ `semantic_search_memories`（向量语义）/ `get_memory_links` / `link_memories` | 关键词、关联、真实向量三种检索并存 |
 | 任务 | `create_task` / `list_tasks` / `get_task` / `save_stage_snapshot` / `handoff_task` / `resume_task` / `complete_task` / `list_events` | 多阶段交接，自动生成初始 plan |
 | 嵌入 | `embedding_status` / `index_memories` | 查看模型、建立/刷新向量索引 |
-| 治理（治理实例） | 45 个：评分 `score_memories`、冲突 `detect_memory_conflicts`、保护 `protect_memory`、整理闭环 `run_memory_maintenance`、向量一致性 `get_vector_consistency`、融合召回 `recall_memories`、激活扩散 `spread_activation`、生命周期 `memory_lifecycle`、关系子图 `get_related_memories` 等 | 见下方"治理实例"章节 |
+| 治理（治理实例） | 49 个：评分 `score_memories`、冲突 `detect_memory_conflicts`、保护 `protect_memory`、整理闭环 `run_memory_maintenance`、向量一致性 `get_vector_consistency`、融合召回 `recall_memories`、激活扩散 `spread_activation`、生命周期 `memory_lifecycle`、关系子图 `get_related_memories`、便携恢复 `preview_memory_restore` / `restore_memory_package` / `delete_memory_package` 等 | 见下方"治理实例"章节 |
 | 反馈闭环 | `record_memory_feedback` / `record_recall` / `summarize_memory_feedback` | 用到/有用/被纠正会真实移动可信度；**曝光（retrieved）永不计分** |
 | 整库快照 | `create_db_snapshot` / `list_db_snapshots` / `restore_db_snapshot` / `check_vector_consistency` / `prune_db_snapshots` | 单动作回滚之外的兜底；恢复前自动先给当前状态拍一张 |
 | 分档保护 | `assess_memory_protection` / `summarize_protection` | critical/high/normal/low 由分数与类别推导，只收紧不放松 |
@@ -31,8 +31,8 @@
 | 取值冲突 | （`detect_memory_conflicts` 内置 `value_conflict`） | 同骨架不同数值判为取值矛盾，建议两条都保留，不再当重复归档 |
 | 记忆库浏览 | `/api/memories/timeline` / `/api/memories/breakdown`（面板） | 全库按天/分类/访问热度统计；访问记账走 `touch_access`（召回与详情各记一次，列表不记） |
 
-**核心实例 `bionic-agent`：21 个工具。** 日常使用只挂它即可，固定工具清单 token 成本低。
-**治理实例 `bionic-agent-governance`：45 个工具。** 需要记忆治理/整理/融合召回时再挂。
+**核心实例 `bionic-agent`：36 个工具。** 日常使用只挂它即可，固定工具清单 token 成本低。含 4 个备份包工具（`export_memory_package` / `list_memory_packages` / `inspect_memory_package` / `validate_memory_package`）。
+**治理实例 `bionic-agent-governance`：49 个工具。** 需要记忆治理/整理/融合召回/便携恢复时再挂。
 
 > 注：因 handoff_task 历史 bug 已修复——现在 handoff 会一并返回展开后的 `task.plan`（结构化对象），不再是 `plan_json` 字符串。
 
@@ -68,7 +68,7 @@ python -m venv .venv
 ```bash
 .venv/Scripts/python -m compileall app
 .venv/Scripts/python tests/smoke_test.py
-.venv/Scripts/python tests/verify_mcp_split_test.py   # 应打印 Core=21 Gov=33 VERIFY_OK
+.venv/Scripts/python tests/verify_mcp_split_test.py   # 应打印 core=36 / governance=49 / 合计 85，6 项全 PASS
 ```
 
 ### 3. 挂到 DeepSeek Harness（或任意 MCP 宿主）
@@ -102,7 +102,7 @@ python -m venv .venv
 > 治理入口已内置 sys.path 兜底，但**统一用 `-m app.mcp_server_gov` 最省心**。
 > 参考文件：`deepseek-harness-mcp.example.yml`。
 
-重启宿主后，核心实例应可立即调用；治理实例挂载后即可用上 45 个治理工具。
+重启宿主后，核心实例应可立即调用；治理实例挂载后即可用上 49 个治理工具。
 
 ---
 
@@ -115,10 +115,21 @@ python -m venv .venv
 ```bash
 # 装好依赖后（含新建的 fastapi / uvicorn）
 .venv/Scripts/python -m app.admin_ui                # 默认 http://127.0.0.1:8899
-.venv/Scripts/python -m app.admin_ui --host 0.0.0.0 --port 8900   # 自定义
+.venv/Scripts/python -m app.admin_ui --port 8900     # 只换端口，仍只监听本机
 # 或走安装好的入口
 bionic-agent-admin
 ```
+
+> **安全边界（请先读这段）**：面板**没有任何身份认证**，默认只绑定 `127.0.0.1`。
+> 绑定非本机地址（`0.0.0.0` / `192.168.x.x` / 机器名）会被**拒绝启动**并退出码 2，
+> 因为那等于把「删记忆 / 恢复整库 / 导出备份」的接口交给同网段所有人。
+> 确实要暴露到局域网时必须显式授权，并自担风险：
+>
+> ```bash
+> .venv/Scripts/python -m app.admin_ui --host 0.0.0.0 --allow-remote
+> ```
+>
+> 此时会打印安全警告。`--allow-remote` 只是「你知道后果」的授权声明，**不是认证机制**。
 
 浏览器打开 `http://127.0.0.1:8899` 即可。面板直接用 `app.*` 的现成函数读写与 MCP 同一份
 数据库，因此**和 MCP 工具完全等价、实时同步**——在面板里改的记忆，MCP 工具立刻能读到。
@@ -347,7 +358,7 @@ node_modules 可解析、patch 内容、`dsh.engines.dsh` 与真实运行时版�
 ```
 bionic-agent-mcp/
 ├── app/
-│   ├── mcp_server.py        # 双实例定义（mcp + mcp_gov）+ 21 核心工具
+│   ├── mcp_server.py        # 双实例定义（mcp + mcp_gov）+ 36 核心工具
 │   ├── mcp_server_gov.py    # 治理实例启动入口（python -m app.mcp_server_gov）
 │   ├── admin_ui.py          # 可视化管理面板（python -m app.admin_ui，FastAPI）
 │   ├── admin_ui.html        # 面板前端（内联 CSS+JS，零外部依赖）
@@ -374,7 +385,7 @@ bionic-agent-mcp/
 
 ---
 
-## 五个"不显然"的设计决定
+## 九个"不显然"的设计决定
 
 这几处看起来可以更简单，但简单版本会在真实使用里悄悄出错，所以写在这里，
 免得以后被"优化"回原样。
@@ -467,6 +478,61 @@ B: DSH 桌面版每次重启端口都会变，这次是 51366
 `synchronous=NORMAL`；`transaction()` 用 `BEGIN IMMEDIATE`——deferred 事务先读后写会被
 提升并报 `SQLITE_BUSY_SNAPSHOT`，而 busy_timeout **不重试**这个错误。
 
+### 9. 概念桥是放大器，不是召回器（`app/memory_lexical.py`）
+
+用户问「插件装完没反应是为什么」，正确答案 F04 讲的是「**改完需重启 DSH 才生效**」——
+两者字面零重叠，所以词法分里它只命中泛化的「插件」两个字，排到第 8。
+而 F01 的标题里就有「插件市场」，同样只命中两个字，却因为命中在标题（权重 6 vs 正文 2）
+拿到满分强度，稳坐第 1。
+
+修法不是给 F04 提权（那等于给一条记忆打补丁），而是补上**症状 → 机制**这一步跳跃：
+
+```
+查询侧：必须同时含「动作已完成」词（装完/改了/放进去了…）
+       且含「否定后果」词（没反应/没生效/还是旧的…）
+       且 detect_intent(query) == install_no_effect
+记忆侧：正文/标签/标题里含「机制词」（才生效/需重启/必须重启/看不出变化…）
+两侧同时成立 → s' = s + α × (1 - s)，α = CONCEPT_BRIDGE_ALPHA = 0.20
+```
+
+六条必须一起看的事实（改之前先读完，否则很容易"优化"坏）：
+
+- **`s` 是纯词法分，不是融合分。** 混入发生在 `score_all` 内部、融合之前。所以
+  `F04 0.254 → 0.367` 这个融合总分增量是**两段**叠出来的：keyword 段
+  `(0.349-0.186)×0.556 = +0.090`，加上 activation 段 `1.0×0.022 = +0.022`。
+- **activation 那段是二阶效应，不是桥接直接改的。** `recall_memories` 的 seed 门是
+  `lex >= 0.3`（`app/memory_lifecycle.py`）；F04 桥接后从 0.186 抬到 0.349，**跨过 0.3**
+  才从「非 seed」变成「seed」，激活分量于是 0 → 1.0。F11 同理。
+  改 seed 阈值或融合权重时，这一段会跟着变，必须重新复评。
+- **它是放大器，不是召回器。** `score_all` 只对「词法已有命中」的记忆打分
+  （零命中的直接 `continue`），桥接没有机会把它们拉进候选。所以它永远救不了
+  「一条字面完全不沾边的记忆」——那种情况要改的是记忆内容或同义词，不是 α。
+- **当前记忆侧全库只有 2 条命中**：F04（`src:F04`）与 F11（本地骨架并入 MCP 知识库）。
+  F11 是**误命中**——它讲的是 knowledge root，只是正文里有一句「必须重启 DSH 才生效」。
+  这类"顺带提到机制"的记录天然会被误抬，是目前已知的主要噪声来源。
+- **α = 0.25 实测会让 45 题 R@1 从 30/41 掉到 29/41、MRR 0.8211→0.8089**，
+  因为 `为什么改了代码没生效` 会被 F04 抢走第一名（正确答是 L03「验证胜于自信」）。
+  **不要把 α 往上调**——0.20 是扫参得到的边界，离退化点只有 0.05 余量。
+- **只诊断、不改分**：`recall_memories(explain=True)` 的每条结果会带一个 `_bridge`
+  块（`bridge_hit_count` / `bridge_hit_memory_ids` / `seed_threshold_crossing_count` /
+  `bridge_alpha` / `bridge_enabled` / `seed_threshold`）。它由
+  `CONCEPT_BRIDGE_DIAGNOSTICS` 开关控制，**只在 explain 时输出，不含查询原文，
+  不影响任何分数与排序**。
+
+#### 什么时候必须复评
+
+以下任一发生，就要用固定题库（45 题 / 24 题 / 38 题）+ 隔离库重跑，并记录变更前后指标：
+
+1. 记忆侧桥接命中数明显增长（比如从 2 条变成 5 条以上，或新写入的记忆开始大量触发）
+2. `lex >= 0.3` 这个 seed 阈值被改动
+3. `RECALL_WEIGHTS` / `recall_profile` 的融合权重被改动
+4. `CONCEPT_BRIDGE_ALPHA` 或三个短语表（动作词/症状词/机制词）被改动
+5. 45 题、24 题、38 题任一指标发生变化
+6. 新增了与概念桥相关的意图分类或规则
+
+**刻意不做**：不设"命中数超阈值就自动调 α"之类的机制。α 的取值只由离线扫参决定，
+自动调参会让一个未经验证的数字悄悄改掉线上排序，出事时无法复现。
+
 ---
 
 ## 可移植 / 传播要点
@@ -512,7 +578,7 @@ B: DSH 桌面版每次重启端口都会变，这次是 51366
 |---|---|
 | `tests/smoke_test.py` | DB 迁移与记忆读写（离线，临时库） |
 | `tests/embedding_test.py` | 向量持久化兼容 |
-| `tests/verify_mcp_split_test.py` | 双实例工具注册验证（核心 31 + 治理 46 = 77） |
+| `tests/verify_mcp_split_test.py` | 双实例工具注册验证（核心 36 + 治理 49 = 85） |
 | `tests/concurrency_test.py` | 6 进程并发建库/写、跨进程持锁等待、busy_timeout 可配（8 项） |
 | `tests/feedback_loop_test.py` | 反馈闭环：retrieved 不计分、分层权重、±25% 上限、端到端分数真会动（26 项） |
 | `tests/snapshot_test.py` | 整库快照/恢复：sha256 校验、中途失败整库回滚、id 序列重置（31 项） |
@@ -527,14 +593,33 @@ B: DSH 桌面版每次重启端口都会变，这次是 51366
 | `tests/review_release_test.py` | 待审核保留的进与出：被藏的真检索不到、裁决后回到检索、`pending` 不解除、幂等、可回滚（25 项） |
 | `tests/knowledge_test.py` | 知识库导入与检索：幂等重导入、删块连带删向量、按路径取文档时 chunks 不能空、38 条检索基准 recall@1/@3 全中（26 项） |
 | `tests/activation_test.py` | 激活扩散的种子来源：访问痕迹能当种子、usage 弱于显式激活、零命中查询里也生效、扩散是纯读（16 项） |
+| `tests/lexical_test.py` | 词法检索三段基准：标题自召回 ≥90%/≥95%、8 条口语题融合 @1 ≥5 且 @3 ≥7、3 条纯语义题 @3 ≥2（16 项） |
+| `tests/concept_bridge_test.py` | 概念桥边界：缺动作词/缺症状词/意图不匹配/记忆无机制都不触发、双侧成立才抬、不重复混入、值域 0..1、关闭≡原始、公式 `s+α(1-s)` 精确（68 项） |
+| `tests/concept_bridge_diag_test.py` | 概念桥诊断：开/关分数与排序逐字节相同、命中 id 集合与实际抬分集合相同、跨 seed 阈值数与按定义重算一致、负向查询不触发、生产库未触碰（40 项） |
+| `tests/init_db_probe_test.py` | 初始化只读探测：已建库走只读路径且 sha256/size/mtime_ns 不变、新库正常、缺表/缺列/旧版本/半初始化能识别并安全迁移、损坏与锁冲突明确报错、并发幂等（94 项） |
+| `tests/db_backup_test.py` | SQLite 物理备份：基本/WAL/失败安全/保留策略/边界，备份可独立打开、验证失败不删历史、干扰文件不受影响（104 项） |
+| `tests/portable_backup_metadata_test.py` | 便携备份元数据读取隔离：指定 db_path 读取、多库互不干扰、全程不连生产库、库不存在不建空库、WAL 可见性、零附带 sidecar（90 项） |
+| `tests/admin_backup_restore_test.py` | 管理面板「备份与恢复中心」：8 类路由、一次性令牌只存内存、full_replace 强确认、状态机各分支（104 项） |
+| `tests/admin_host_guard_test.py` | 面板绑定守卫：本机地址放行、远程必须显式 `--allow-remote` 否则 exit 2、拒绝路径零数据库触碰（64 项） |
+| `tests/run_tests_optimize_test.py` | 测试入口抗优化：外部设 `PYTHONOPTIMIZE=1` 时断言不被剥离、`_env()` 清空该变量、三个裸 assert 套件不假通过（12 项） |
 
 示例用法：
 
 ```bash
+# Node 侧（面板/插件）一把跑完
 node dsh-panel-client/test/all.mjs
-.venv/Scripts/python tests/smoke_test.py
-.venv/Scripts/python tests/verify_mcp_split_test.py
+
+# Python 侧：统一入口，跑全部 33 个套件（每项独立子进程 + 超时）
+python tests/run_tests.py
+python tests/run_tests.py --list                       # 只看会跑哪些
+python tests/run_tests.py --only lexical,concept_bridge  # 只跑指定的几项
+python tests/run_tests.py --stop                       # 第一个失败就停
 ```
+
+`tests/run_tests.py` 只做**发现 / 执行 / 汇总**三件事，不引入任何测试框架，也不改写
+任何测试：它按文件名发现 `tests/*_test.py`，每个跑在独立子进程里（各测试都会在进程内
+改 `db.DB_PATH`，同进程串跑会互相污染），判定只看退出码。单独跑与统跑结果一致——
+单项也能直接 `python tests/xxx_test.py`。
 
 > 这些测试都跑真实 SQLite（临时库），不用 mock。凡是"分数应该动"的断言，都盯
 > 具体数值是否变化——只查计数增长的测试在坏代码上也会通过。

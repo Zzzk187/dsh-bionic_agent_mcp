@@ -147,6 +147,7 @@
   <button class="tab" data-tab="tasks">任务</button>
   <button class="tab" data-tab="governance">治理</button>
   <button class="tab" data-tab="safety">快照与提炼</button>
+  <button class="tab" data-tab="backup">备份与恢复中心</button>
 </div>
 
 <!-- ========== 记忆 ========== -->
@@ -317,6 +318,106 @@
     <button class="ghost" id="resumeGo">取续跑包</button>
   </div>
   <div id="resumeOut"></div>
+</div>
+
+<!-- ========== 备份与恢复中心 ========== -->
+<div class="view" id="backup">
+  <div class="hint" style="margin:0 0 12px;color:var(--muted);font-size:12px;line-height:1.7">
+    这里是本机记忆的完整备份与恢复入口。所有打包/校验/恢复的核心逻辑都由后端提供，
+    页面只负责展示与确认。<b>恢复会覆盖当前记忆与知识库，操作前请确认已创建备份包</b>；
+    恢复后向量不会自动重建。<b>一次性确认令牌只在当前页面内存中持有，刷新即失效，需重新预览。</b>
+  </div>
+
+  <!-- 概览 -->
+  <h3 style="margin-top:6px">概览</h3>
+  <div class="card" id="bkOverview">
+    <div class="toolbar" style="margin-bottom:6px">
+      <button class="ghost" id="bkRefreshTarget">刷新环境状态</button>
+    </div>
+    <div id="bkTargetOut" class="small muted">正在读取目标环境…</div>
+  </div>
+
+  <!-- 备份包管理 -->
+  <h3 style="margin-top:22px">备份包管理</h3>
+  <div class="toolbar">
+    <button class="ghost" id="bkPkgRefresh">刷新列表</button>
+    <span class="muted small" id="bkPkgCount"></span>
+  </div>
+  <div id="bkPkgList"></div>
+
+  <h4 style="margin:18px 0 8px">创建备份</h4>
+  <div class="hint" style="margin:0 0 8px;color:var(--muted);font-size:12px;line-height:1.6">
+    四种模式：<b>source_only</b> 仅权威源目录（最快、不含数据库）；
+    <b>source_with_db</b> 源目录 + 数据库逻辑快照；
+    <b>full</b> 完整包（含项目元数据，可跨设备完整迁移）；
+    <b>knowledge_tasks</b> 仅知识/日记 .md 与任务相关表。
+  </div>
+  <div class="toolbar">
+    <select id="bkExportMode">
+      <option value="source_only">source_only（仅源）</option>
+      <option value="source_with_db">source_with_db（源+DB）</option>
+      <option value="full">full（完整）</option>
+      <option value="knowledge_tasks">knowledge_tasks（知识+任务）</option>
+    </select>
+    <button id="bkExport">创建备份</button>
+    <span id="bkExportStatus" class="muted small"></span>
+  </div>
+
+  <!-- 恢复中心 -->
+  <h3 style="margin-top:22px">恢复中心</h3>
+  <div class="hint" style="margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.6">
+    按顺序操作：选择备份包 → 生成预览 → 核对差异 → 显式确认 → 执行。
+    <b>预览是只读的，不会改动任何数据</b>；只有确认后才会执行恢复。
+  </div>
+  <div class="card">
+    <div class="toolbar">
+      <select id="bkRestorePkg" style="min-width:280px"><option value="">选择备份包…</option></select>
+      <select id="bkRestoreMode" title="恢复模式">
+        <option value="merge">merge（合并，保留现有）</option>
+        <option value="full_replace">full_replace（完整替换，危险）</option>
+      </select>
+      <select id="bkPolicy" title="冲突策略">
+        <option value="keep_target">keep_target（保留现有）</option>
+        <option value="use_package">use_package（用备份包）</option>
+        <option value="keep_both">keep_both（两者都留）</option>
+      </select>
+      <label class="muted small"><input type="checkbox" id="bkDeleteExtras" /> 删除多余项</label>
+      <button id="bkPreview">生成恢复预览</button>
+    </div>
+    <div id="bkPreviewOut" class="small muted">尚未生成预览。</div>
+  </div>
+
+  <!-- 恢复详情 / 历史 -->
+  <h3 style="margin-top:22px">恢复历史</h3>
+  <div class="toolbar">
+    <button class="ghost" id="bkHistRefresh">刷新历史</button>
+  </div>
+  <div id="bkHistOut"></div>
+</div>
+
+<!-- 备份包详情 Modal -->
+<div class="modal-bg" id="bkDetailBg">
+  <div class="modal">
+    <h3>备份包详情 <span id="bkDetailPid" class="muted small"></span></h3>
+    <div id="bkDetailBody"></div>
+    <div class="row">
+      <button id="bkDetailValidate" class="ghost">完整性校验</button>
+      <button id="bkDetailClose">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 恢复确认 Modal（携一次性令牌，仅内存） -->
+<div class="modal-bg" id="bkConfirmBg">
+  <div class="modal">
+    <h3>确认恢复</h3>
+    <div id="bkConfirmBody"></div>
+    <div id="bkConfirmExtra" style="margin-top:12px"></div>
+    <div class="row">
+      <button class="ghost" id="bkConfirmCancel">取消</button>
+      <button class="danger" id="bkConfirmGo">确认执行</button>
+    </div>
+  </div>
 </div>
 
 <!-- 编辑/新建 记忆 Modal -->
@@ -560,6 +661,7 @@ $$('.tab').forEach(t=>t.onclick=()=>{
   if(t.dataset.tab==='tasks') loadTasks();
   if(t.dataset.tab==='governance') loadGovStatus();
   if(t.dataset.tab==='safety') loadSafety();
+  if(t.dataset.tab==='backup') loadBackup();
 });
 
 /* ---------- 记忆星图 ---------- *
@@ -1921,6 +2023,256 @@ $('#govConsol').onclick = async ()=>{
   const rows=j.data?.candidates||[];
   $('#govOut').innerHTML=`<h3>巩固候选 (${rows.length})</h3>`+(rows.length?rows.map(r=>`<div class="card small"><span class="badge ${r.status}">${esc(r.status)}</span> <b>${esc(r.kind||r.type||'')}</b> ${esc(r.title||'')}<div class="muted">${esc(r.detail||'')}</div></div>`).join(''):'<div class="empty">暂无候选</div>');
 };
+
+/* ---------- 备份与恢复中心（S4）----------
+ * 令牌（confirmation_token）只存在这个内存变量里，绝不写 localStorage/sessionStorage、
+ * URL 或日志。页面刷新/重新预览都会覆盖它 —— 这是设计，不是缺陷。
+ */
+let bkPending = null;      // 当前预览结果（含一次性令牌）
+let bkDetailPid = '';      // 详情 Modal 当前包 id
+
+const BK_MODE_DESC = {
+  source_only: '仅权威源目录', source_with_db: '源 + 数据库逻辑快照',
+  full: '完整包（可跨设备迁移）', knowledge_tasks: '知识/日记 + 任务相关表'
+};
+const BK_SEV = {
+  PREVIEW_READY:'preview', CONFIRMED:'preview', COMPLETED:'ok', ROLLED_BACK:'warn',
+  ROLLBACK_FAILED:'err', ROLLBACK_REQUIRED:'warn', ROLLBACK_STARTED:'warn'
+};
+function bkBytes(n){
+  if(n==null) return '-';
+  return n>=1048576 ? (n/1048576).toFixed(1)+' MB' :
+         n>=1024 ? (n/1024).toFixed(1)+' KB' : n+' B';
+}
+function bkChips(list, cls){
+  list = list||[];
+  return list.length ? list.map(x=>`<span class="pill ${cls||''}">${esc(x)}</span>`).join(' ') : '<span class="muted">无</span>';
+}
+async function loadBackup(){
+  await Promise.all([loadBkTarget(), loadBkPackages(), loadBkHistory()]);
+}
+async function loadBkTarget(){
+  const j = await api('/api/backup/target');
+  if(!j.ok){ $('#bkTargetOut').innerHTML = `<span style="color:var(--danger)">${esc(j.message||'目标检查失败')}</span>`; return; }
+  const d = j.data || {};
+  const emb = d.embedding||{};
+  const rows = [
+    ['源目录', d.source_exists!=null?(d.source_exists?'就绪':'不存在'):'未提供'],
+    ['数据库', d.db_exists!=null?(d.db_exists?'已连接':'不存在'):'未提供'],
+    ['schema 版本', d.schema_version ?? '未提供'],
+    ['记忆 / 任务 / 文档 / 向量', [d.memory_count,d.task_count,d.doc_count,d.vector_count].map(x=>x??'未提供').join(' / ')],
+    ['Embedding', [emb.model_name,emb.dimensions!=null?emb.dimensions+'维':null].filter(x=>x!=null).join(' · ')||'未提供'],
+    ['外键检查', d.fk_violations!=null?d.fk_violations+' 处违规':'未提供'],
+    ['知识库镜像', (d.mirror&&d.mirror.in_sync)!=null?(d.mirror.in_sync?'已同步':'未同步'):'未提供'],
+    ['未完成任务', d.active_restores!=null?d.active_restores:'未提供']
+  ];
+  const blockers = d.blockers||[];
+  $('#bkTargetOut').innerHTML =
+    (blockers.length?`<div style="color:var(--danger);margin-bottom:8px">${bkChips(blockers)}</div>`:'') +
+    ((d.warnings||[]).length?`<div style="color:var(--warn);margin-bottom:8px">${bkChips(d.warnings,'warn')}</div>`:'') +
+    `<div class="detail-grid">${rows.map(([k,v])=>`<div class="k">${esc(k)}</div><div>${esc(v)}</div>`).join('')}</div>`;
+}
+async function loadBkPackages(){
+  const j = await api('/api/backup/packages');
+  if(!j.ok){ $('#bkPkgList').innerHTML=`<div class="empty">${esc(j.message||'读取失败')}</div>`; return; }
+  const rows = j.data?.packages||[];
+  $('#bkPkgCount').textContent = `共 ${j.data?.count ?? rows.length} 个备份包`;
+  $('#bkPkgList').innerHTML = rows.length
+    ? `<table><tr><th>包名</th><th>模式</th><th>创建时间</th><th>格式</th><th>大小</th><th>校验</th><th>可完整恢复</th><th>操作</th></tr>${
+        rows.map(p=>`<tr>
+          <td class="small">${esc(p.name||p.package_id)}</td>
+          <td>${esc(p.backup_type||'-')}</td>
+          <td class="small">${esc((p.created_at||'').slice(0,19))}</td>
+          <td>v${esc(p.format_version??'-')}</td>
+          <td>${bkBytes(p.size_bytes)}</td>
+          <td>${esc(p.check_status||'-')}</td>
+          <td>${p.supports_full_restore?'是':'否'}</td>
+          <td><button class="ghost" style="font-size:12px" data-bkdetail="${esc(p.package_id)}">详情</button>
+              <button class="ghost" style="font-size:12px" data-bkdel="${esc(p.package_id)}">删除</button></td>
+        </tr>`).join('')}</table>`
+    : '<div class="empty">还没有备份包，先在上方创建一个</div>';
+  $$('#bkPkgList [data-bkdetail]').forEach(b=>b.onclick=()=>showBkDetail(b.dataset.bkdetail));
+  $$('#bkPkgList [data-bkdel]').forEach(b=>b.onclick=()=>deleteBkPackage(b.dataset.bkdel));
+  // 同步恢复中心的下拉（保留当前选择）
+  const sel = $('#bkRestorePkg'); const cur = sel.value;
+  sel.innerHTML = '<option value="">选择备份包…</option>' + rows.map(p=>
+    `<option value="${esc(p.package_id)}">${esc(p.name||p.package_id)} · ${esc(p.backup_type||'')}</option>`).join('');
+  if(rows.some(p=>p.package_id===cur)) sel.value = cur;
+}
+async function exportBkPackage(){
+  const mode = $('#bkExportMode').value;
+  const st = $('#bkExportStatus');
+  st.textContent = `正在导出（${BK_MODE_DESC[mode]||mode}）…`; st.className='muted small';
+  const j = await api('/api/backup/export', {method:'POST', body:JSON.stringify({backup_type:mode})});
+  if(!j.ok){ st.textContent='导出失败'; st.className='small'; toast(j.message||'导出失败','err'); loadBkPackages(); return; }
+  const d = j.data||{};
+  st.textContent = `完成：${d.file_count??'?'} 文件 / ${bkBytes(d.size_bytes)}`; st.className='small';
+  toast('备份包已创建', 'ok');
+  loadBkPackages();
+}
+async function showBkDetail(pid){
+  bkDetailPid = pid;
+  $('#bkDetailPid').textContent = pid;
+  $('#bkDetailBody').innerHTML = '<div class="muted">读取中…</div>';
+  $('#bkDetailBg').classList.add('show');
+  const j = await api('/api/backup/packages/'+encodeURIComponent(pid));
+  if(!j.ok){ $('#bkDetailBody').innerHTML=`<div style="color:var(--danger)">${esc(j.message||'读取失败')}</div>`; return; }
+  const d = j.data||{}, m = d.manifest||{}, v = d.validation||{};
+  const emb = m.embedding||{};
+  const rows = [
+    ['格式 / 版本', `${esc(m.format_name||'bionic-memory-package')} v${esc(m.format_version??'-')}`],
+    ['备份类型', esc(m.backup_type||'-')], ['创建时间', esc((m.created_at||'').slice(0,19))],
+    ['项目版本', esc(m.project_version||'-')], ['schema 版本', esc(m.schema_version??'0')],
+    ['文件数 / 大小', `${d.file_count??'-'} / ${bkBytes(d.total_size_bytes)}`],
+    ['Embedding', [emb.model_name,emb.dimensions!=null?emb.dimensions+'维':null].filter(Boolean).join(' · ')||'未提供']
+  ];
+  $('#bkDetailBody').innerHTML =
+    (d.blockers?.length?`<div style="color:var(--danger);margin-bottom:8px">${bkChips(d.blockers)}</div>`:'') +
+    `<div class="detail-grid">${rows.map(([k,val])=>`<div class="k">${esc(k)}</div><div>${val}</div>`).join('')}</div>` +
+    `<div style="margin-top:10px" class="small">校验：${v.ok===true?'<span style="color:var(--ok)">通过</span>':v.ok===false?'<span style="color:var(--danger)">失败</span>':'未校验'}</div>` +
+    (v.warnings?.length?`<div style="margin-top:6px" class="small">${bkChips(v.warnings,'warn')}</div>`:'') +
+    `<div class="hint" style="margin-top:10px;color:var(--muted);font-size:12px">出于隐私，页面不展示逐文件清单与记忆正文。</div>`;
+}
+async function validateBkDetail(){
+  if(!bkDetailPid) return;
+  toast('校验中…','ok');
+  const j = await api(`/api/backup/packages/${encodeURIComponent(bkDetailPid)}/validate`, {method:'POST'});
+  if(!j.ok){ toast(j.message||'校验失败','err'); return; }
+  const d = j.data||{};
+  toast(d.ok?`校验通过（${d.file_count??'?'} 文件）`:`校验失败：${(d.errors||[]).slice(0,1).join('')}`, d.ok?'ok':'err');
+  showBkDetail(bkDetailPid);
+}
+async function deleteBkPackage(pid){
+  if(!confirm(`确定删除备份包「${pid}」？\n\n此操作不可恢复。若该包正在被恢复使用，删除会被拒绝。`)) return;
+  const j = await api('/api/backup/packages/'+encodeURIComponent(pid), {method:'DELETE'});
+  toast(j.ok?'备份包已删除':(j.message||'删除失败'), j.ok?'ok':'err');
+  loadBkPackages();
+}
+async function previewBkRestore(){
+  const pid = $('#bkRestorePkg').value;
+  if(!pid){ toast('请先选择备份包','err'); return; }
+  const mode = $('#bkRestoreMode').value, policy = $('#bkPolicy').value;
+  const del = $('#bkDeleteExtras').checked;
+  $('#bkPreviewOut').textContent='生成预览中（只读，不会改动数据）…';
+  const j = await api('/api/backup/preview', {method:'POST', body:JSON.stringify({
+    package_id:pid, restore_mode:mode, conflict_policy:policy, delete_extras:del})});
+  if(!j.ok){ $('#bkPreviewOut').innerHTML=`<div style="color:var(--danger)">${esc(j.message||'预览失败')}</div>`; return; }
+  const d = j.data||{};
+  // 令牌仅内存持有
+  bkPending = d;
+  const s = d.summary||{}, blockers = d.blockers||[], warns = d.warnings||[];
+  const delItems = d.deletions||[];
+  const cnt = o => o&&typeof o==='object' ? Object.entries(o).map(([k,v])=>`${esc(k)} ${esc(v)}`).join(' / ')||'无' : '未提供';
+  $('#bkPreviewOut').innerHTML =
+    (blockers.length?`<div style="color:var(--danger);margin-bottom:8px"><b>阻断项（不可执行）：</b> ${bkChips(blockers)}</div>`:'') +
+    (warns.length?`<div style="color:var(--warn);margin-bottom:8px">${bkChips(warns,'warn')}</div>`:'') +
+    `<div class="detail-grid">
+       <div class="k">备份包</div><div>${esc(d.backup_type||'-')} · ${esc((d.package_sha256||'').slice(0,12))}…</div>
+       <div class="k">恢复模式 / 策略</div><div>${esc(d.restore_mode||'-')} / ${esc(d.conflict_policy||'-')}</div>
+       <div class="k">新增 / 更新 / 跳过</div><div>${cnt(s.added||s.inserted)} / ${cnt(s.updated)} / ${cnt(s.skipped)}</div>
+       <div class="k">删除项</div><div>${delItems.length?bkChips(delItems.map(x=>typeof x==='string'?x:JSON.stringify(x))):'无'}</div>
+       <div class="k">冲突数</div><div>${s.conflicts??'未提供'}</div>
+       <div class="k">向量兼容</div><div>${esc((d.compatibility||{}).embedding_compatible??'未提供')}</div>
+       <div class="k">保护性备份</div><div>${d.backup_required?'必须（执行前自动创建）':'不需要'}</div>
+       <div class="k">预计空间</div><div>${d.required_space_bytes?bkBytes(d.required_space_bytes):'未提供'}</div>
+     </div>` +
+    (d.ok && !blockers.length
+      ? `<div style="margin-top:12px"><button class="danger" id="bkDoConfirm">确认恢复…</button></div>`
+      : `<div class="muted small" style="margin-top:10px">存在阻断项或预览未通过，无法进入确认。</div>`);
+  const btn = $('#bkDoConfirm');
+  if(btn) btn.onclick = openBkConfirm;
+}
+function openBkConfirm(){
+  const d = bkPending;
+  if(!d || !d.ok || (d.blockers||[]).length || !d.confirmation_token){ toast('预览无效或令牌缺失','err'); return; }
+  const s = d.summary||{};
+  $('#bkConfirmBody').innerHTML =
+    `<div class="detail-grid">
+       <div class="k">备份类型</div><div>${esc(d.backup_type||'-')}</div>
+       <div class="k">恢复模式</div><div><b>${esc(d.restore_mode)}</b></div>
+       <div class="k">冲突策略</div><div>${esc(d.conflict_policy)}</div>
+       <div class="k">预计变更</div><div>新增 ${s.added??s.inserted??'?'} / 更新 ${s.updated??'?'} / 删除 ${(d.deletions||[]).length}</div>
+     </div>
+     <div style="color:var(--danger);margin-top:12px"><b>风险提示：</b>恢复会写入当前记忆与知识库。执行前系统会自动创建保护性备份；恢复后向量不会自动重建。</div>`;
+  const extra = $('#bkConfirmExtra');
+  if(d.restore_mode==='full_replace'){
+    extra.innerHTML = `<label style="color:var(--danger)"><input type="checkbox" id="bkRiskCheck" /> 我已理解完整替换会覆盖现有数据</label>
+      <label>请输入确认短语 <b>确认完整替换</b></label>
+      <input id="bkPhrase" placeholder="确认完整替换" autocomplete="off" />`;
+  } else { extra.innerHTML=''; }
+  $('#bkConfirmBg').classList.add('show');
+}
+async function doBkExecute(){
+  const d = bkPending;
+  if(!d || !d.confirmation_token){ toast('令牌已失效，请重新预览','err'); $('#bkConfirmBg').classList.remove('show'); return; }
+  if(d.restore_mode==='full_replace'){
+    if(!$('#bkRiskCheck')?.checked){ toast('请勾选风险确认','err'); return; }
+    if(($('#bkPhrase')?.value||'').trim()!=='确认完整替换'){ toast('确认短语不正确','err'); return; }
+  }
+  const payload = {
+    package_id:d.package_id, restore_mode:d.restore_mode, conflict_policy:d.conflict_policy,
+    delete_extras:!!d.delete_extras, restore_id:d.restore_id,
+    confirmation_token:d.confirmation_token
+  };
+  if(d.restore_mode==='full_replace') payload.confirm_phrase = '确认完整替换';
+  $('#bkConfirmGo').disabled = true;
+  const cf = await api('/api/backup/confirm', {method:'POST', body:JSON.stringify(payload)});
+  if(!cf.ok){ $('#bkConfirmGo').disabled=false; toast(cf.message||'确认失败','err'); return; }
+  const ex = await api('/api/backup/execute', {method:'POST', body:JSON.stringify(payload)});
+  $('#bkConfirmGo').disabled = false;
+  $('#bkConfirmBg').classList.remove('show');
+  bkPending = null;   // 令牌一次性使用后即弃
+  if(!ex.ok){ toast(ex.message||'执行请求失败','err'); loadBkHistory(); return; }
+  const r = ex.data||{};
+  toast(r.state==='COMPLETED'?'恢复完成':(r.state||'已提交')+'（详见历史）', r.ok?'ok':'err');
+  $('#bkPreviewOut').innerHTML = `<div>执行状态：<b>${esc(r.state||'-')}</b>${(r.errors||[]).length?' — '+esc((r.errors||[]).slice(0,1)[0]):''}</div>`;
+  loadBkHistory(); loadBkTarget();
+}
+async function loadBkHistory(){
+  const j = await api('/api/backup/restores?limit=50');
+  if(!j.ok){ $('#bkHistOut').innerHTML=`<div class="empty">${esc(j.message||'读取失败')}</div>`; return; }
+  const rows = (j.data?.restores||j.data?.history||[]);
+  $('#bkHistOut').innerHTML = rows.length
+    ? `<table><tr><th>restore_id</th><th>状态</th><th>开始时间</th><th>操作</th></tr>${
+        rows.map(r=>`<tr><td class="small">${esc(r.restore_id||r.id||'-')}</td>
+          <td><span class="badge ${BK_SEV[r.state]||''}">${esc(r.state||'-')}</span></td>
+          <td class="small">${esc((r.started_at||r.created_at||'').slice(0,19))}</td>
+          <td><button class="ghost" style="font-size:12px" data-bkhist="${esc(r.restore_id||r.id||'')}">详情</button></td></tr>`).join('')}</table>`
+    : '<div class="empty">还没有恢复记录</div>';
+  $$('#bkHistOut [data-bkhist]').forEach(b=>b.onclick=()=>showBkRestore(b.dataset.bkhist));
+}
+async function showBkRestore(rid){
+  if(!rid) return;
+  const j = await api('/api/backup/restores/'+encodeURIComponent(rid));
+  if(!j.ok){ toast(j.message||'读取失败','err'); return; }
+  const d = j.data||{};
+  const stages = d.stages||{};
+  const stageHtml = Object.keys(stages).length
+    ? Object.entries(stages).map(([k,v])=>`<div class="small"><b>${esc(k)}</b>: ${esc(typeof v==='object'?(v.state||v.status||JSON.stringify(v)):v)}</div>`).join('')
+    : '<div class="muted small">阶段明细未提供</div>';
+  const r = await api(`/api/backup/restores/${encodeURIComponent(rid)}/rollback`, {method:'POST'});
+  const rb = r.data||{};
+  $('#bkPreviewOut').innerHTML =
+    `<div class="detail-grid">
+       <div class="k">restore_id</div><div class="small">${esc(rid)}</div>
+       <div class="k">当前状态</div><div><span class="badge ${BK_SEV[d.state]||''}">${esc(d.state||'-')}</span></div>
+       <div class="k">warnings</div><div>${bkChips(d.warnings)}</div>
+       <div class="k">errors</div><div>${bkChips(d.errors||[])}</div>
+     </div><div style="margin-top:8px">${stageHtml}</div>` +
+    (rb.severe
+      ? `<div style="color:var(--danger);margin-top:10px"><b>严重故障：</b>${esc(rb.guidance||'回滚失败，需人工介入，请勿重复点击恢复。')}</div>`
+      : `<div class="muted small" style="margin-top:10px">${esc(rb.guidance||'')}（引擎在异常时会自动回滚）</div>`);
+}
+/* ---------- 备份与恢复中心 事件绑定 ---------- */
+$('#bkRefreshTarget').onclick = loadBkTarget;
+$('#bkPkgRefresh').onclick = loadBkPackages;
+$('#bkExport').onclick = exportBkPackage;
+$('#bkPreview').onclick = previewBkRestore;
+$('#bkHistRefresh').onclick = loadBkHistory;
+$('#bkDetailClose').onclick = ()=>$('#bkDetailBg').classList.remove('show');
+$('#bkDetailValidate').onclick = validateBkDetail;
+$('#bkConfirmCancel').onclick = ()=>{ $('#bkConfirmBg').classList.remove('show'); bkPending=null; };
+$('#bkConfirmGo').onclick = doBkExecute;
 
 /* ---------- 启动 ---------- */
 (async ()=>{

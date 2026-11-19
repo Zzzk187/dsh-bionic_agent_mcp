@@ -90,17 +90,21 @@ def main() -> int:
 
     # ---- 1) 首次导入（不建向量：本测试验证的是文本与打分，向量另有覆盖）----
     r1 = knowledge.import_docs(embed=False)
+    # 数字不写死：知识库会随笔记增长（106 → 109 → 110 都发生过）。
+    # 写死 106 的后果是这个测试天天红，然后没人看它——比没有测试更糟。
+    # 真正要守的是「盘上有的都导了」「每篇都有块」这两条。
     check("首次导入读到全部文档",
-          r1["docs_seen"] == 106 and r1["docs_imported"] == 106,
+          r1["docs_seen"] == r1["docs_imported"] and r1["docs_seen"] > 0,
           f'seen={r1["docs_seen"]} imported={r1["docs_imported"]}')
-    check("分块数与分节规则一致（781 段）",
-          r1["chunks_written"] == 781, f'chunks={r1["chunks_written"]}')
+    check("每篇文档至少产生一个块",
+          r1["chunks_written"] >= r1["docs_imported"],
+          f'chunks={r1["chunks_written"]} docs={r1["docs_imported"]}')
     check("导入无错误", not r1["errors"], str(r1["errors"])[:120])
 
     # ---- 2) 幂等：再跑一次不应重写任何东西 ----
     r2 = knowledge.import_docs(embed=False)
     check("重导入幂等（不改任何文档）",
-          r2["docs_imported"] == 0 and r2["docs_unchanged"] == 106,
+          r2["docs_imported"] == 0 and r2["docs_unchanged"] == r1["docs_imported"],
           f'imported={r2["docs_imported"]} unchanged={r2["docs_unchanged"]}')
     check("重导入不重写分块", r2["chunks_written"] == 0,
           f'chunks_written={r2["chunks_written"]}')
@@ -209,12 +213,20 @@ def main() -> int:
 
     # ---- 9) 概况与实际数据一致 ----
     st = knowledge.status()
-    check("status 的文档数与库一致", st["docs"] == 106, f'docs={st["docs"]}')
-    check("status 分两侧统计",
-          st["by_root"]["knowledge"]["docs"] == 82 and st["by_root"]["mine"]["docs"] == 24,
+    check("status 的文档数与库一致", st["docs"] == r1["docs_imported"],
+          f'docs={st["docs"]} imported={r1["docs_imported"]}')
+    # 不写死 root 集合：2026-11-08 加入骨架（memory/script）后，写死它就天天红，
+    # 而天天红的测试没人看。断言"该在的都在、没有意外的新 root、合计对得上"。
+    known_roots = {"knowledge", "mine", "memory", "script"}
+    check("status 分侧统计",
+          {"knowledge", "mine"} <= set(st["by_root"])
+          and set(st["by_root"]) <= known_roots
+          and all(v["docs"] > 0 for v in st["by_root"].values())
+          and sum(v["docs"] for v in st["by_root"].values()) == st["docs"],
           f'{st["by_root"]}')
-    check("knowledge 域分布非空且合计为 82",
-          sum(st["knowledge_domains"].values()) == 82,
+    check("knowledge 域分布合计等于 knowledge 侧文档数",
+          sum(st["knowledge_domains"].values())
+          == st["by_root"]["knowledge"]["docs"],
           f'sum={sum(st["knowledge_domains"].values())}')
 
     failed = [n for n, ok, _ in RESULTS if not ok]

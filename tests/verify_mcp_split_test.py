@@ -1,4 +1,4 @@
-"""Verify the MCP server-split: core (31) + governance (46) instances.
+"""Verify the MCP server-split: core (36) + governance (49) instances.
 
 Real import of ``app.mcp_server``; asserts the two FastMCP instances register
 exactly the intended tool sets with no overlap. Run:
@@ -30,6 +30,14 @@ CORE_EXPECTED = [
     # same session as the memories, and a search tool that needs a second mount
     # would simply not be used. Read-only, three tools, short arguments.
     "search_knowledge", "get_knowledge_doc", "knowledge_status",
+    # 2026-11-08 本地并入 MCP 的接缝：一次调用同时返回记忆与知识命中，
+    # 让本地 PS 脚本不必再起 Python 子进程就能查全库。只读、五个短参数，
+    # 与 search_knowledge 同属"天天要用"的那一类。
+    "recall_all",
+    # S3: portable memory package tools — package export/inspect/validate/list
+    # are read-mostly routine operations, so they live on the daily core server.
+    "export_memory_package", "list_memory_packages",
+    "inspect_memory_package", "validate_memory_package",
 ]
 GOV_EXPECTED = [
     "warmup_embeddings", "score_memories", "get_memory_governance_status",
@@ -53,6 +61,9 @@ GOV_EXPECTED = [
     "check_vector_consistency", "prune_db_snapshots",
     "assess_memory_protection", "summarize_protection",
     "find_distillation_candidates", "apply_distillation", "list_distillations",
+    # S3: restore is a governance/high-risk operation (explicit one-shot token,
+    # protective backup, rollback). Preview/restore/delete stay on governance.
+    "preview_memory_restore", "restore_memory_package", "delete_memory_package",
 ]
 
 PASS = 0

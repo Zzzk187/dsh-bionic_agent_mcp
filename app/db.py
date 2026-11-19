@@ -3,6 +3,7 @@ import sqlite3
 import time
 from pathlib import Path
 from contextlib import closing, contextmanager
+from urllib.parse import quote
 
 # BIONIC_DB_PATH lets a second instance (or a test) run against its own database
 # instead of the user's live one. Without it, anything that spins up
@@ -44,7 +45,381 @@ def _retry_locked(fn, attempts: int = 40, delay: float = 0.05):
             time.sleep(delay * (1 + i * 0.25))   # mild backoff, keep total small
     raise last
 
-def init_db():
+# ---------------------------------------------------------------------------
+# S6-FIX-03: 初始化前的只读探测
+# ---------------------------------------------------------------------------
+# 为什么要有这一段：`init_db()` 以前每次调用都无条件连库 + `PRAGMA
+# journal_mode=WAL` + 跑全套幂等 DDL。对**已经初始化好**的库，这些写一个都不
+# 需要——但 `journal_mode=WAL` 是文件格式变更，会碰文件头、刷新 mtime，于是
+# 「只是启动一次」也会让生产库的指纹变掉，只读审计也就没法自证清白。
+#
+# 所以先做一次**纯只读**探测：能确定"结构完整"就直接返回，一个字节都不写。
+# 探测失败或拿不准时绝不假设完整——一律退回原来的完整初始化，那套 DDL 幂等，
+# 多跑一次无害。宁可多写一次，不可少写一次。
+
+SCHEMA_PHASE = 7
+"""当前 schema 阶段号。
+
+db.py 没有 user_version、也没有迁移版本表，版本是靠"哪些表/列存在"隐式表达的
+（S6 审计已记录：user_version=0、无 %migrat%/%schema% 表）。这里把这种隐式表达
+显式化，好让探测给出可读结论，但**判定仍然只看表/列/索引/触发器在不在**，
+不看这个数字。
+"""
+
+REQUIRED_TABLES = (
+    "memories",
+    "tasks",
+    "snapshots",
+    "events",
+    "memory_links",
+    "memory_embeddings",
+    "governance_runs",
+    "governance_actions",
+    "memory_conflicts",
+    "memory_feedback",
+    "consolidation_candidates",
+    "knowledge_docs",
+    "knowledge_chunks",
+    "knowledge_embeddings",
+)
+
+# 每张表必须有的列。只用 PRAGMA table_info 读结构，不碰任何行、不看内容。
+REQUIRED_COLUMNS = {
+    "memories": (
+        "id", "content", "category", "source", "confidence", "status",
+        "created_at", "updated_at",
+        "tags_json", "expires_at", "supersedes_id", "conflict_group",
+        "importance_score", "confidence_score", "freshness_score", "access_count",
+        "last_accessed_at", "last_evaluated_at", "memory_status", "protected",
+        "memory_type",
+    ),
+    "tasks": (
+        "id", "title", "goal", "status", "current_stage", "plan_json", "result",
+        "created_at", "updated_at", "retry_count",
+    ),
+    "snapshots": ("id", "task_id", "stage", "summary", "state_json", "created_at"),
+    "events": ("id", "task_id", "event_type", "detail", "created_at"),
+    "memory_links": (
+        "id", "source_memory_id", "target_memory_id", "relation", "note", "created_at",
+    ),
+    "memory_embeddings": (
+        "memory_id", "model_name", "content_hash", "dimension", "vector_json", "updated_at",
+    ),
+    "governance_runs": (
+        "id", "mode", "status", "rule_version", "started_at", "finished_at",
+        "candidates_scanned", "actions_generated", "actions_applied", "actions_failed",
+        "summary", "stats_json",
+    ),
+    "governance_actions": (
+        "id", "run_id", "action_type", "memory_id", "target_memory_id",
+        "old_value_json", "new_value_json", "reason", "rule_version",
+        "approval_status", "execution_status", "created_at", "executed_at",
+        "error_message", "rollback_info_json", "rolled_back_at",
+    ),
+    "memory_conflicts": (
+        "id", "run_id", "memory_id", "candidate_memory_id", "conflict_type",
+        "similarity", "confidence", "reason", "recommendation", "resolution",
+        "resolved_by", "resolved_at", "created_at", "rule_version",
+    ),
+    "memory_feedback": (
+        "memory_id", "retrieved_count", "used_count", "helpful_count",
+        "not_relevant_count", "corrected_count", "last_retrieved_at",
+        "last_used_at", "last_feedback_at", "history_json",
+    ),
+    "consolidation_candidates": (
+        "id", "kind", "status", "title", "detail", "source_memory_ids",
+        "target_memory_id", "confidence", "rule_version", "created_at",
+        "resolved_at", "resolved_by", "notes_json",
+    ),
+    "knowledge_docs": (
+        "id", "path", "rel_path", "root", "domain", "title", "content",
+        "content_hash", "byte_size", "mtime", "chunk_count", "imported_at", "updated_at",
+    ),
+    "knowledge_chunks": (
+        "id", "doc_id", "ord", "heading", "content", "content_hash",
+        "char_count", "updated_at",
+    ),
+    "knowledge_embeddings": (
+        "chunk_id", "model_name", "content_hash", "dimension", "vector_json", "updated_at",
+    ),
+}
+
+# 索引不影响数据正确性，但它是 init_db 承诺的一部分：缺了就说明这张库没跑到当前
+# 初始化，应该让它补上（CREATE INDEX IF NOT EXISTS 幂等）。
+REQUIRED_INDEXES = (
+    "idx_memories_status_updated",
+    "idx_snapshots_task_stage",
+    "idx_events_task_created",
+    "idx_memory_embeddings_model",
+    "idx_gov_actions_run",
+    "idx_gov_actions_status",
+    "idx_gov_actions_memory",
+    "idx_mem_conflicts_memory",
+    "idx_mem_conflicts_resolution",
+    "idx_memories_gov_status",
+    "idx_feedback_memory",
+    "idx_consol_kind_status",
+    "idx_consol_status_created",
+    "idx_knowledge_chunks_doc_ord",
+    "idx_knowledge_docs_root",
+    "idx_knowledge_chunks_doc",
+    "idx_knowledge_embeddings_model",
+)
+
+REQUIRED_TRIGGERS = ("trg_memories_confidence_score",)
+
+
+def _probe_uri(path: Path) -> str:
+    """构造探测用的只读 URI。
+
+    Windows 的 `D:/a/b.db` 要变成 `file:/D:/a/b.db?mode=ro`：绝对路径需要前导
+    斜杠，反斜杠换成正斜杠，特殊字符要转义（否则路径里的 `?`/`#` 会被当成查询
+    串/锚点）。`mode=ro` 保证 SQLite 既不创建文件也不写库。
+    """
+    p = str(Path(path).resolve()).replace("\\", "/")
+    if not p.startswith("/"):
+        p = "/" + p
+    return "file:" + quote(p, safe="/:") + "?mode=ro"
+
+
+def _wal_has_content(db_path: Path) -> bool:
+    """库旁边是否有一个**装着数据**的 -wal。
+
+    WAL 模式下最近的提交可能还留在 -wal 里、主文件尚未合并。这种时候不能用
+    immutable 读（它只看主文件，会读到旧结构），必须真只读打开。
+    干净的库在最后一个连接正常关闭后 SQLite 会删掉 -wal/-shm，所以"没有 -wal"
+    是最常见的情形——也正是我们希望走上零副作用那条路的情形。
+    """
+    wal = Path(str(db_path) + "-wal")
+    try:
+        return wal.is_file() and wal.stat().st_size > 0
+    except OSError:
+        return True   # 判断不了就当有，走安全的那条
+
+
+def _sidecar_snapshot(db_path: Path) -> dict:
+    """记录 -wal/-shm/-journal 的存在与大小，用来证明探测没留下东西。"""
+    out: dict = {}
+    for suffix in ("-wal", "-shm", "-journal"):
+        p = Path(str(db_path) + suffix)
+        try:
+            out[suffix] = p.stat().st_size if p.is_file() else None
+        except OSError:
+            out[suffix] = None
+    return out
+
+
+def _derive_schema_phase(tables, missing_columns) -> int:
+    """按"哪些表/列已存在"推导阶段号。只用于报告，不参与完整性判定。"""
+    if "memories" not in tables:
+        return 0
+    missing = {c.split(".", 1)[1] for c in missing_columns if c.startswith("memories.")}
+    if "importance_score" in missing:
+        return 4
+    if "memory_type" in missing:
+        return 5
+    if "knowledge_docs" not in tables:
+        return 6
+    return SCHEMA_PHASE
+
+
+def probe_database_state(db_path=None) -> dict:
+    """只读探测数据库初始化状态。**不改库，也不创建库文件。**
+
+    返回字段：
+      database_exists   库文件在不在（不在不算错误）
+      readable          能否只读打开并读到 sqlite_master
+      schema_complete   是否已满足当前阶段的完整 schema
+      schema_version    按表/列存在性推导的阶段号（仅报告用）
+      db_user_version   PRAGMA user_version 原值（本库不用它，仅供诊断）
+      journal_mode      读到的 journal_mode（immutable 下反映主文件头，仅供诊断）
+      missing_tables / missing_columns / missing_indexes / missing_triggers
+      needs_migration   是否该进完整初始化
+      probe_mode        实际读法："immutable" | "readonly" | ""
+      error             出错说明；空串表示没出错
+      sidecar_created   探测途中是否新建了 -wal/-shm（正常应为 False）
+      path              被测库路径
+
+    两条硬约定（任务 §四）：
+      * 任何异常都写进 `error` 且 `readable=False`，**绝不静默当完整**；
+      * 探测失败 **不等于** 库不存在——`database_exists` 只看文件在不在。
+    """
+    target = Path(db_path) if db_path is not None else DB_PATH
+    res: dict = {
+        "database_exists": False,
+        "readable": False,
+        "schema_complete": False,
+        "schema_version": 0,
+        "db_user_version": None,
+        "journal_mode": "",
+        "missing_tables": list(REQUIRED_TABLES),
+        "missing_columns": [],
+        "missing_indexes": list(REQUIRED_INDEXES),
+        "missing_triggers": list(REQUIRED_TRIGGERS),
+        "needs_migration": True,
+        "probe_mode": "",
+        "error": "",
+        "sidecar_created": False,
+        "path": str(target),
+    }
+
+    try:
+        res["database_exists"] = target.is_file()
+    except OSError as exc:
+        res["error"] = "无法判断库文件是否存在：%s" % exc
+        return res
+
+    if not res["database_exists"]:
+        # 不存在不是错误：这是一张待建的新库，交给 init_db 走建库路径。
+        return res
+
+    # 选读法：-wal 里没内容时用 immutable（零副作用，连 -shm 都不建）；-wal 里
+    # 有内容时必须真只读打开，否则读不到尚未合并的 schema。
+    use_immutable = not _wal_has_content(target)
+    uri = _probe_uri(target)
+    if use_immutable:
+        uri += "&immutable=1"
+    res["probe_mode"] = "immutable" if use_immutable else "readonly"
+
+    before = _sidecar_snapshot(target)
+    conn = None
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=BUSY_TIMEOUT_SECONDS)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA busy_timeout=%d" % int(BUSY_TIMEOUT_SECONDS * 1000))
+        except sqlite3.Error:
+            pass
+
+        # 这一步才真正触发读；损坏的库会在这里抛 "file is not a database"。
+        master = conn.execute(
+            "SELECT type, name FROM sqlite_master "
+            "WHERE type IN ('table', 'index', 'trigger')"
+        ).fetchall()
+        tables = {r["name"] for r in master if r["type"] == "table"}
+        indexes = {r["name"] for r in master if r["type"] == "index"}
+        triggers = {r["name"] for r in master if r["type"] == "trigger"}
+        res["readable"] = True
+
+        try:
+            row = conn.execute("PRAGMA journal_mode").fetchone()
+            res["journal_mode"] = (row[0] if row else "") or ""
+        except sqlite3.Error:
+            res["journal_mode"] = ""
+        try:
+            row = conn.execute("PRAGMA user_version").fetchone()
+            res["db_user_version"] = row[0] if row else None
+        except sqlite3.Error:
+            res["db_user_version"] = None
+
+        # sqlite_ 开头的系统表不算 schema 的一部分。
+        tables = {t for t in tables if not t.startswith("sqlite_")}
+        res["missing_tables"] = [t for t in REQUIRED_TABLES if t not in tables]
+        res["missing_indexes"] = [i for i in REQUIRED_INDEXES if i not in indexes]
+        res["missing_triggers"] = [t for t in REQUIRED_TRIGGERS if t not in triggers]
+
+        # 只对**存在**的表查列；缺表就不必再逐条列它的列（缺表本身已经足够）。
+        missing_cols: list = []
+        for table in REQUIRED_TABLES:
+            if table in res["missing_tables"]:
+                continue
+            try:
+                have = {r["name"] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+            except sqlite3.Error as exc:
+                res["readable"] = False
+                res["schema_complete"] = False
+                res["needs_migration"] = True
+                res["error"] = "读取表结构失败（%s）：%s" % (table, exc)
+                return res
+            for col in REQUIRED_COLUMNS.get(table, ()):
+                if col not in have:
+                    missing_cols.append("%s.%s" % (table, col))
+        res["missing_columns"] = missing_cols
+
+        res["schema_version"] = _derive_schema_phase(tables, missing_cols)
+        res["schema_complete"] = (
+            not res["missing_tables"]
+            and not res["missing_columns"]
+            and not res["missing_indexes"]
+            and not res["missing_triggers"]
+        )
+        res["needs_migration"] = not res["schema_complete"]
+        return res
+    except sqlite3.Error as exc:
+        res["readable"] = False
+        res["schema_complete"] = False
+        res["needs_migration"] = True
+        res["error"] = "%s: %s" % (type(exc).__name__, exc)
+        return res
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        res["sidecar_created"] = _sidecar_snapshot(target) != before
+
+
+def init_db() -> dict:
+    """确保数据库可用。**已初始化的库走只读路径，一个字节都不写。**
+
+    四条分支（任务 §五）：
+      1. 探测失败（损坏 / 打不开 / 读不到结构）
+         → 退回完整初始化。那套 DDL 幂等；库真坏了会在写路径上明确报错，
+           不会被当成"已完整"悄悄放过。
+      2. 库不存在 → 完整初始化（建库、建表、建索引、迁移）。
+      3. 库存在且 schema 完整 → 只读探测后直接返回：不开可写连接、不设
+         journal_mode、不动 mtime。
+      4. 库存在但 schema 不完整 → 完整初始化补齐；补完**重新探测**，仍不完整
+         就抛错，绝不假报成功。
+
+    返回本次做了什么的结构化说明。历史调用方都忽略返回值，故兼容。
+    """
+    report: dict = {"path": str(DB_PATH), "probe": None, "action": "", "verified": False}
+
+    probe = probe_database_state()
+    report["probe"] = probe
+
+    if probe["readable"] and probe["schema_complete"]:
+        report["action"] = "readonly-skip"
+        report["verified"] = True
+        return report
+
+    if not probe["database_exists"]:
+        report["action"] = "full-init (new)"
+    elif probe["error"]:
+        # 不算完整，但也不能当不存在：走完整初始化，让真实错误在那一步带着
+        # 原始异常冒出来，而不是在这里被吞掉。
+        report["action"] = "full-init (probe-error: %s)" % probe["error"]
+    else:
+        report["action"] = "full-init (incomplete)"
+
+    # 并发保护（任务 §六.8）：从探测到这里之间，另一个实例可能已经把初始化做完
+    # 了（Core 与 Governance 同时启动就是这种情形）。写之前再确认一次，能省掉
+    # 大半的重复 DDL。这一次确认失败也照旧往下走，不做判定依据。
+    if probe["database_exists"]:
+        again = probe_database_state()
+        if again["readable"] and again["schema_complete"]:
+            report["probe"] = again
+            report["action"] = "readonly-skip (settled by peer)"
+            report["verified"] = True
+            return report
+
+    _init_db_write()
+
+    after = probe_database_state()
+    report["probe_after"] = after
+    if not (after["readable"] and after["schema_complete"]):
+        raise RuntimeError(
+            "init_db() 写入后 schema 仍不完整："
+            "missing_tables=%r missing_columns=%r error=%r"
+            % (after["missing_tables"], after["missing_columns"], after["error"])
+        )
+    report["verified"] = True
+    return report
+
+
+def _init_db_write():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     # NOTE: `with sqlite3.connect(...)` only commits on exit, it never closes the
     # handle. On Windows that leaves the file locked, so database files cannot be
@@ -495,6 +870,42 @@ def transaction():
         raise
     finally:
         conn.close()
+
+
+@contextmanager
+def read_transaction():
+    """A single, consistent read view across several SELECTs (WAL snapshot).
+
+    `connect()` is autocommit: every SELECT is its own implicit transaction, so
+    a multi-table dump can read table A at T1 and table B at T2 while a writer
+    commits in between -- the payload would mix two different states. A plain
+    `BEGIN` here pins one WAL snapshot: the first SELECT establishes it and all
+    later SELECTs in this transaction see exactly that same view. This is what
+    `snapshots.create_snapshot` needs so payload + table_counts describe one
+    moment in time.
+
+    Additive only: `connect()` and `transaction()` keep their original behaviour,
+    so Phases 1-8 are untouched. This is read-only -- nothing is committed. The
+    PRAGMAs that cannot change inside a transaction are set before BEGIN.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_SECONDS)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=%d" % int(BUSY_TIMEOUT_SECONDS * 1000))
+    _retry_locked(lambda: conn.execute("PRAGMA journal_mode=WAL"))
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("BEGIN")  # deferred read txn; first SELECT pins the WAL snapshot
+    try:
+        yield conn
+        conn.rollback()   # read-only: cleanly release the snapshot, no writes
+    except BaseException:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
 
 def rowdict(row):
     return dict(row) if row else None

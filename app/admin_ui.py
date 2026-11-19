@@ -6,7 +6,12 @@
 
 启动:  python -m app.admin_ui            (默认 http://127.0.0.1:8899)
        bionic-agent-admin               (pyproject 注册的控制台入口)
-       python -m app.admin_ui --port 9000 --host 0.0.0.0
+       python -m app.admin_ui --port 9000          (只换端口，仍只监听本机)
+
+安全:  面板没有任何身份认证，默认只绑定 127.0.0.1。
+       绑定非本机地址（0.0.0.0 / 192.168.x.x / 机器名）会**拒绝启动**，
+       必须显式加 --allow-remote 表示你知道后果：
+       python -m app.admin_ui --host 0.0.0.0 --allow-remote
 
 前端是一个零外部依赖的自包含 HTML（app/admin_ui.html），离线可用；
 语义检索复用 bionic 已缓存的本地 FastEmbed 模型，不联网。
@@ -14,10 +19,13 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
+import re
 import sys
 import uuid
+import zipfile
 from datetime import datetime
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -43,6 +51,9 @@ from app import task_resume as resume_mod
 from app import recall_profile as recall_prof
 from app import expiry as expiry_mod  # noqa: E402
 from app import feedback_loop as feedback  # noqa: E402
+# S4：复用 S1 便携包 / S2 恢复引擎，面板不重写任何业务逻辑。
+from app import portable_backup as pbackup  # noqa: E402
+from app import portable_restore as prestore  # noqa: E402
 from app.db import rowdict as db_rowdict  # noqa: E402
 
 HTML_PATH = Path(__file__).resolve().with_name("admin_ui.html")
@@ -173,6 +184,114 @@ def _run(fn, *args, **kwargs):
     if isinstance(result, dict) and result.get("ok") is False:
         return _err(result.get("message", "操作失败"), status=404)
     return _ok(result)
+
+
+# ---------------------------------------------------------------------------
+# S4 备份与恢复中心：受管边界 / 脱敏 / 活动包检查（面板不重写业务逻辑）
+# ---------------------------------------------------------------------------
+_S4_PID_RE = re.compile(r"^bionic-memory-[A-Za-z0-9_.-]+$")
+
+# 恢复进行中（未到终态）的状态集合；命中这些状态的包禁止删除。
+_S4_ACTIVE_STATES = {
+    "CONFIRMED", "PRE_RESTORE_BACKUP_CREATED", "STAGING_READY",
+    "SOURCE_RESTORED", "DATABASE_RESTORED", "PATHS_REANCHORED",
+    "POST_RESTORE_VERIFIED", "ROLLBACK_REQUIRED", "ROLLBACK_STARTED",
+    "ROLLBACK_VERIFIED",
+}
+
+
+def _backup_pkg_path(package_id):
+    """把前端提交的 package_id 解析成受管目录内的 zip 路径。
+
+    前端只能提交 list 返回的 stem，绝不接受路径。这里复用 S1 的
+    _resolve_package_dir（强制位于项目根内），拼名后再 relative_to 校验，
+    杜绝盘符 / .. / 分隔符注入。
+    """
+    pid = str(package_id or "").strip()
+    if (not _S4_PID_RE.match(pid) or "/" in pid or "\\" in pid or ".." in pid):
+        return None, "非法 package_id（必须是 bionic-memory- 开头的受管包 ID）"
+    try:
+        d = pbackup._resolve_package_dir()
+    except ValueError as exc:
+        return None, str(exc)
+    target = (d / (pid + ".zip")).resolve()
+    try:
+        target.relative_to(d.resolve())
+    except ValueError:
+        return None, "目标不在受管包目录内"
+    return target, ""
+
+
+def _active_restore_package_ids():
+    """当前处于活动状态（已确认、未到终态）的恢复记录引用的包 ID。
+
+    用于禁止删除"正在恢复的包"。只读 S2 已有日志格式，不另建状态机。
+    """
+    d = prestore._log_dir()
+    ids = set()
+    if not d.is_dir():
+        return ids
+    for p in d.glob("*.json"):
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if rec.get("state") in _S4_ACTIVE_STATES and rec.get("package_id"):
+            ids.add(rec["package_id"])
+    return ids
+
+
+def _redact_path(value):
+    """去掉本机绝对路径，只保留末段，避免向页面暴露用户目录。"""
+    if not value:
+        return value
+    s = str(value).replace("\\", "/")
+    if re.match(r"^[A-Za-z]:", s) or s.startswith("/"):
+        return ".../" + s.rstrip("/").split("/")[-1]
+    return s
+
+
+def _safe_target_info(target):
+    """脱敏 S2 inspect_restore_target 输出，只保留页面需要的安全字段。"""
+    if not isinstance(target, dict):
+        return target
+    keys = ("ok", "source_exists", "db_exists", "embedding", "doc_count",
+            "memory_count", "task_count", "vector_count", "fk_violations",
+            "mirror", "warnings", "blockers")
+    out = {k: target.get(k) for k in keys}
+    for key in ("db_fingerprint", "source_fingerprint"):
+        fp = target.get(key)
+        if isinstance(fp, dict):
+            out[key] = {k: v for k, v in fp.items() if k not in ("path", "root")}
+    mirror = out.get("mirror")
+    if isinstance(mirror, dict):
+        out["mirror"] = {k: _redact_path(v) if isinstance(v, str) else v
+                         for k, v in mirror.items()}
+    return out
+
+
+def _package_meta(package_id, path):
+    """轻量读 manifest 摘要供列表展示；不跑完整校验（校验由单独接口完成）。"""
+    meta = {
+        "package_id": package_id, "backup_type": "", "format_version": None,
+        "created_at": "", "supports_full_restore": False,
+        "check_status": "unchecked", "warnings": [],
+    }
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            if "manifest.json" in zf.namelist():
+                m = json.loads(zf.read("manifest.json"))
+                bt = m.get("backup_type") or ""
+                meta["backup_type"] = bt
+                meta["format_version"] = m.get("format_version")
+                meta["created_at"] = m.get("created_at") or ""
+                meta["supports_full_restore"] = bt in ("full", "source_with_db")
+                w = m.get("warnings") or []
+                meta["warnings"] = w[:10] if isinstance(w, list) else []
+    except (OSError, ValueError, zipfile.BadZipFile):
+        meta["check_status"] = "error"
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +797,358 @@ def api_snapshot_vector_check():
 
 
 # ---------------------------------------------------------------------------
+# S4 备份与恢复中心 —— 写接口：导出与删除（Batch C）
+# ---------------------------------------------------------------------------
+@app.post("/api/backup/export")
+def api_backup_export(payload: dict):
+    """创建备份：只接受四模式白名单，直接转调 S1 export_portable。
+
+    不接受任何路径参数（source_root/db_path/package_dir 一律不传），全部走
+    S1 受管默认。前端不参与 ZIP 打包与 SHA-256。
+    """
+    bt = (payload.get("backup_type") or "").strip()
+    if bt not in pbackup.BACKUP_TYPES:
+        return _err(f"未知导出模式：{bt}（可用：{', '.join(pbackup.BACKUP_TYPES)}）", status=400)
+    # source_version_override 只允许内部固定值，不接受前端任意字符串（防伪造版本元数据）
+    res = pbackup.export_portable(bt)
+    if not res.get("ok"):
+        return _err("；".join(res.get("errors") or ["导出失败"]), status=400)
+    return _ok({
+        "package_id": res.get("package_id"),
+        "archive_name": res.get("archive_name"),
+        "backup_type": res.get("backup_type"),
+        "file_count": res.get("file_count"),
+        "total_size_bytes": res.get("total_size_bytes"),
+        "archive_size_bytes": res.get("archive_size_bytes"),
+        "validation": res.get("validation") or {},
+        "warnings": res.get("warnings") or [],
+    })
+
+
+@app.delete("/api/backup/packages/{package_id}")
+def api_backup_package_delete(package_id: str):
+    """受管删除：先拒绝正在恢复的包，再转调 S1 delete_package。"""
+    path, why = _backup_pkg_path(package_id)
+    if path is None:
+        return _err(why, status=400)
+    if package_id in _active_restore_package_ids():
+        return _err("该备份包正被一个未完成的恢复任务使用，禁止删除", status=409)
+    res = pbackup.delete_package(package_id)
+    if not res.get("ok"):
+        # 删除失败保留文件，如实报错（绝不伪装成功）
+        return _err("；".join(res.get("errors") or ["删除失败"]), status=400)
+    return _ok({
+        "package_id": package_id,
+        "deleted": True,
+        "warnings": res.get("warnings") or [],
+    })
+
+
+# ---------------------------------------------------------------------------
+# S4 备份与恢复中心 —— 恢复预览（Batch D，转调 S2，面板不重写校验/差异/令牌）
+# ---------------------------------------------------------------------------
+@app.post("/api/backup/preview")
+def api_backup_preview(payload: dict):
+    """生成恢复预览与一次性令牌。
+
+    面板不重新实现任何包校验/差异比对/令牌逻辑，全部由 S2 preview_restore 提供
+    （其内部三道门：S1 校验器 + 目标检查 + 模式矩阵 + 兼容性）。令牌只在 HTTP
+    响应里返回给前端内存持有，后端不写日志、不持久化到磁盘。
+    """
+    pid = str(payload.get("package_id") or "").strip()
+    path, why = _backup_pkg_path(pid)
+    if path is None:
+        return _err(why, status=400)
+
+    restore_mode = str(payload.get("restore_mode") or "merge").strip()
+    conflict_policy = str(payload.get("conflict_policy") or "keep_target").strip()
+    if restore_mode not in prestore.RESTORE_MODES:
+        return _err(f"未知恢复模式：{restore_mode}", status=400)
+    if conflict_policy not in prestore.CONFLICT_POLICIES:
+        return _err(f"未知冲突策略：{conflict_policy}", status=400)
+    delete_extras = bool(payload.get("delete_extras", False))
+
+    res = prestore.preview_restore(
+        path, restore_mode=restore_mode, conflict_policy=conflict_policy,
+        delete_extras=delete_extras,
+    )
+    if not isinstance(res, dict):
+        return _err("预览返回格式异常", status=500)
+
+    # 只回传页面需要的字段；package_path 等绝对路径一律不带出。
+    out = {
+        "ok": bool(res.get("ok")),
+        "restore_id": res.get("restore_id"),
+        "package_id": res.get("package_id"),
+        "package_sha256": res.get("package_sha256"),
+        "backup_type": res.get("backup_type"),
+        "restore_mode": res.get("restore_mode"),
+        "conflict_policy": res.get("conflict_policy"),
+        "delete_extras": delete_extras,
+        "summary": res.get("summary") or {},
+        "deletions": res.get("deletions") or [],
+        "compatibility": res.get("compatibility") or {},
+        "warnings": res.get("warnings") or [],
+        "blockers": res.get("blockers") or [],
+        "validation": res.get("validation") or {},
+        "backup_required": res.get("backup_required", True),
+        "required_space_bytes": res.get("required_space_bytes", 0),
+        "target": _safe_target_info(res.get("target") or {}),
+        "message": res.get("message") or "",
+    }
+    # 令牌仅在预览成功（无 blocker）时随响应返回；绝不写入任何日志。
+    out["confirmation_token"] = res.get("confirmation_token") if res.get("ok") else ""
+    out["token_expire_at"] = res.get("token_expire_at") if res.get("ok") else ""
+    return _ok(out)
+
+
+# ---------------------------------------------------------------------------
+# S4 备份与恢复中心 —— 确认与执行（Batch E）
+# 确认消费一次性令牌；执行转调 S2 execute_restore，绝不传 fail_inject。
+# 面板不重写令牌/校验/回滚逻辑，也不自行生成令牌。
+# ---------------------------------------------------------------------------
+_S4_FULL_PHRASE = "确认完整替换"
+
+
+def _scrub_paths(value):
+    """脱敏文本中可能出现的本机绝对路径（Windows 盘符 / POSIX 根路径）。"""
+    if not isinstance(value, str):
+        return value
+    s = re.sub(r"[A-Za-z]:[\\/][^\s，,；;\"']+", ".../", value)
+    s = re.sub(r"(?<![\w])/(?:Users|home|root)/[^\s，,；;\"']+", ".../", s)
+    return s
+
+
+def _s4_restore_args(payload):
+    """从请求体取恢复参数并校验枚举；返回 (pid, path, mode, policy, extras, err)。"""
+    pid = str(payload.get("package_id") or "").strip()
+    path, why = _backup_pkg_path(pid)
+    if path is None:
+        return None, None, None, None, None, why
+    mode = str(payload.get("restore_mode") or "merge").strip()
+    policy = str(payload.get("conflict_policy") or "keep_target").strip()
+    if mode not in prestore.RESTORE_MODES:
+        return None, None, None, None, None, f"未知恢复模式：{mode}"
+    if policy not in prestore.CONFLICT_POLICIES:
+        return None, None, None, None, None, f"未知冲突策略：{policy}"
+    return pid, path, mode, policy, bool(payload.get("delete_extras", False)), ""
+
+
+@app.post("/api/backup/confirm")
+def api_backup_confirm(payload: dict):
+    """显式确认：full_replace 需强确认短语；令牌由 S2 校验并一次性消费。"""
+    pid, path, mode, policy, extras, err = _s4_restore_args(payload)
+    if err:
+        return _err(err, status=400)
+    if mode == "full_replace" and str(payload.get("confirm_phrase") or "").strip() != _S4_FULL_PHRASE:
+        return _err(f"完整替换必须输入确认短语：{_S4_FULL_PHRASE}", status=400)
+
+    restore_id = str(payload.get("restore_id") or "").strip()
+    token = str(payload.get("confirmation_token") or "").strip()
+    if not restore_id or not token:
+        return _err("缺少 restore_id 或 confirmation_token", status=400)
+
+    res = prestore.confirm_restore(
+        restore_id, token, package_path=path, restore_mode=mode,
+        conflict_policy=policy, delete_extras=extras,
+    )
+    if not isinstance(res, dict) or not res.get("ok"):
+        msg = (res or {}).get("message") or "确认失败"
+        return _err(_scrub_paths(str(msg)), status=400)
+    return _ok({
+        "restore_id": restore_id,
+        "state": res.get("state"),
+        "message": _scrub_paths(str(res.get("message") or "")),
+    })
+
+
+@app.post("/api/backup/execute")
+def api_backup_execute(payload: dict):
+    """执行恢复：确认 state==CONFIRMED 后转调 S2；绝不传 fail_inject。"""
+    pid, path, mode, policy, extras, err = _s4_restore_args(payload)
+    if err:
+        return _err(err, status=400)
+    restore_id = str(payload.get("restore_id") or "").strip()
+    if not restore_id:
+        return _err("缺少 restore_id", status=400)
+
+    # 状态闸门：必须先 confirm（state==CONFIRMED）。重复点击时状态已变，S2 也会拒。
+    st = prestore.get_restore_status(restore_id)
+    state = ((st or {}).get("status") or {}).get("state")
+    if state != "CONFIRMED":
+        return _err(f"当前状态 {state or '未知'} 不可执行（需先确认）", status=409)
+
+    # fail_inject / do_reanchor / plan_files 一律不接受前端输入
+    res = prestore.execute_restore(
+        restore_id, "", package_path=path, restore_mode=mode,
+        conflict_policy=policy, delete_extras=extras,
+    )
+    if not isinstance(res, dict):
+        return _err("执行返回格式异常", status=500)
+    out = {
+        "restore_id": restore_id,
+        "ok": bool(res.get("ok")),
+        "state": res.get("state"),
+        "stage_results": res.get("stage_results") or {},
+        "warnings": [_scrub_paths(str(w)) for w in (res.get("warnings") or [])],
+        "errors": [_scrub_paths(str(e)) for e in (res.get("errors") or [])],
+        "message": _scrub_paths(str(res.get("message") or "")),
+    }
+    # 失败/回滚不是 HTTP 错误——如实呈现状态，让页面展示 ROLLBACK_*
+    return _ok(out)
+
+
+@app.post("/api/backup/restores/{restore_id}/rollback")
+def api_backup_restore_rollback(restore_id: str):
+    """回滚结果查询 + 人工介入指引。
+
+    面板不执行真正的回滚：S2 的 rollback_restore 需要 file_undo（仅在 execute
+    内存中、未持久化），且 execute_restore 异常时已自动回滚。本接口只读取当前
+    回滚状态并给出指引；ROLLBACK_FAILED 标记为严重故障。
+    """
+    st = prestore.get_restore_status(restore_id)
+    if not isinstance(st, dict) or not st.get("ok"):
+        return _err("恢复记录不存在", status=404)
+    rec = st.get("status") or {}
+    state = rec.get("state")
+    severe = state == "ROLLBACK_FAILED"
+    guidance = ""
+    if severe:
+        guidance = ("自动回滚未完成；保护性备份与 staging 已保留，"
+                    "请勿重复点击恢复，需人工介入处理。")
+    elif state in ("ROLLBACK_REQUIRED", "ROLLBACK_STARTED"):
+        guidance = "回滚进行中或待回滚，请稍后刷新查看。"
+    elif state == "ROLLED_BACK":
+        guidance = "已回滚到恢复前状态。"
+    else:
+        guidance = "当前无待处理回滚。"
+    return _ok({
+        "restore_id": restore_id,
+        "state": state,
+        "severe": severe,
+        "auto_rollback_by_engine": True,
+        "guidance": guidance,
+        "errors": [_scrub_paths(str(e)) for e in (rec.get("errors") or [])],
+    })
+
+
+# ---------------------------------------------------------------------------
+# S4 备份与恢复中心 —— 只读接口（Batch B）
+# ---------------------------------------------------------------------------
+@app.get("/api/backup/packages")
+def api_backup_packages():
+    """备份包列表：真实包信息 + manifest 摘要，不含绝对路径。"""
+    res = pbackup.list_packages()
+    if not res.get("ok"):
+        return _err("；".join(res.get("errors") or ["包列表读取失败"]), status=400)
+    items = []
+    for pkg in res.get("packages") or []:
+        pid = pkg.get("package_id", "")
+        path, why = _backup_pkg_path(pid)
+        if path is None:
+            continue
+        meta = _package_meta(pid, path)
+        items.append({
+            "package_id": pid,
+            "name": pkg.get("name"),
+            "backup_type": meta["backup_type"],
+            "created_at": pkg.get("created_at") or meta["created_at"],
+            "size_bytes": pkg.get("size_bytes"),
+            "format_version": meta["format_version"],
+            "check_status": meta["check_status"],
+            "supports_full_restore": meta["supports_full_restore"],
+            "warnings": meta["warnings"],
+        })
+    return _ok({"packages": items, "count": len(items)})
+
+
+@app.get("/api/backup/packages/{package_id}")
+def api_backup_package_detail(package_id: str):
+    """包详情：复用 S1 inspect_package，文件清单摘要限长，不暴露记忆正文。"""
+    path, why = _backup_pkg_path(package_id)
+    if path is None:
+        return _err(why, status=400)
+    detail = pbackup.inspect_package(path)
+    if not detail.get("ok") and not (detail.get("manifest") or {}):
+        return _err("包不可读或校验失败", status=400)
+    manifest = detail.get("manifest") or {}
+    # 只给文件数量与类别摘要，绝不给逐文件完整清单（避免超大包拖垮页面/泄露正文）
+    val = detail.get("validation") or {}
+    out = {
+        "package_id": package_id,
+        "ok": detail.get("ok"),
+        "manifest": manifest,
+        "file_count": detail.get("file_count"),
+        "total_size_bytes": detail.get("total_size_bytes"),
+        "validation": {
+            "ok": val.get("ok"),
+            "errors": (val.get("errors") or [])[:20],
+            "warnings": (val.get("warnings") or [])[:20],
+            "checks": val.get("checks") or {},
+        },
+        "blockers": (val.get("errors") or []) if not val.get("ok") else [],
+    }
+    return _ok(out)
+
+
+@app.post("/api/backup/packages/{package_id}/validate")
+def api_backup_package_validate(package_id: str):
+    """完整性校验：复用 S1 validate_package_archive 全 14 项。"""
+    path, why = _backup_pkg_path(package_id)
+    if path is None:
+        return _err(why, status=400)
+    val = pbackup.validate_package_archive(path)
+    return _ok({
+        "package_id": package_id,
+        "ok": val.get("ok"),
+        "errors": (val.get("errors") or [])[:30],
+        "warnings": (val.get("warnings") or [])[:30],
+        "checks": val.get("checks") or {},
+        "file_count": val.get("file_count"),
+        "total_size_bytes": val.get("total_size_bytes"),
+    })
+
+
+@app.get("/api/backup/target")
+def api_backup_target():
+    """恢复目标检查：复用 S2 inspect_restore_target，字段脱敏后返回。"""
+    target = prestore.inspect_restore_target()
+    return _ok(_safe_target_info(target))
+
+
+@app.get("/api/backup/restores")
+def api_backup_restores(limit: int = Query(50, ge=1, le=200)):
+    """恢复历史：复用 S2 list_restore_history。"""
+    return _ok(prestore.list_restore_history(limit=limit))
+
+
+@app.get("/api/backup/restores/{restore_id}")
+def api_backup_restore_detail(restore_id: str):
+    """恢复详情：复用 S2 get_restore_status（已剔除令牌密钥），只做脱敏。"""
+    res = prestore.get_restore_status(restore_id)
+    if not res.get("ok"):
+        return _err(res.get("message", "恢复记录不存在"), status=404)
+    status = dict(res.get("status") or {})
+    for k in ("package_path", "backup_dir", "source_root", "db_path"):
+        if k in status:
+            status[k] = _redact_path(status[k])
+    stages = status.get("stages")
+    if isinstance(stages, list):
+        cleaned = []
+        for s in stages:
+            sd = dict(s)
+            detail = sd.get("detail")
+            if isinstance(detail, dict):
+                detail = {dk: (_redact_path(dv) if isinstance(dv, str) and (
+                    "path" in dk or "dir" in dk or "root" in dk) else dv)
+                    for dk, dv in detail.items()}
+                sd["detail"] = detail
+            cleaned.append(sd)
+        status["stages"] = cleaned
+    return _ok({"status": status})
+
+
+# ---------------------------------------------------------------------------
 # 分档保护
 # ---------------------------------------------------------------------------
 @app.get("/api/protection")
@@ -922,11 +1393,101 @@ def static_file(name: str):
     return FileResponse(target, media_type=media)
 
 
+def is_local_bind_host(host: str) -> bool:
+    """判断一个 `--host` 值是否只可能接受本机连接。
+
+    允许的情况（都是「只有本机能连上」）：
+      - 回环地址：127.0.0.0/8 里除 127.0.0.1 之外的写法，以及 `localhost`、`::1`
+      - 回环域名的等价写法（大小写、末尾点）
+
+    拒绝的情况：
+      - 通配地址 `0.0.0.0` / `::`（监听所有网卡）
+      - 私网/公网 IP（192.168.x.x、10.x.x.x、8.8.8.8 …）
+      - 机器名（即便它今天解析到 127.0.0.1，也可能被 hosts 或 DNS 改掉，
+        不把它当成可信任的静态事实）
+
+    空字符串走「关闭监听」语义（uvicorn 不接受），这里按不安全处理，
+    交给调用方拒绝——宁可拒绝也不猜。
+    """
+    if not isinstance(host, str):
+        return False
+    value = host.strip().lower().rstrip(".")
+    if not value:
+        return False
+    if value == "localhost":
+        return True
+    # 去掉 IPv6 的 [::1] 方括号写法
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return addr.is_loopback
+
+
+def check_bind_safety(host: str, allow_remote: bool) -> tuple[bool, str]:
+    """启动前的绑定安全检查。返回 (是否允许启动, 面向用户的提示文本)。
+
+    纯函数、不碰数据库、不读文件——所以测试可以直接调用它，
+    不需要真的起一个 uvicorn 服务。
+
+    规则只有一条：**非本机地址必须显式授权**。
+    `allow_remote=True` 时放行，但提示文本会变成安全警告；
+    它不是认证机制，只是「用户自己承认知道风险」的一个签名位。
+    """
+    if is_local_bind_host(host):
+        if allow_remote:
+            # 本机地址 + 明确授权：不冲突，但没必要，提醒一句即可
+            return True, (
+                f"[bionic-agent-admin] 提示：--host {host} 本来就只监听本机，"
+                f"--allow-remote 在这里没有作用。"
+            )
+        return True, ""
+
+    if allow_remote:
+        return True, (
+            f"[bionic-agent-admin] ⚠ 安全警告：管理面板正在绑定 {host}，已暴露到远程网络。\n"
+            f"[bionic-agent-admin] ⚠ 当前管理面板【没有任何身份认证】。\n"
+            f"[bionic-agent-admin] ⚠ 能访问这个地址的人可以删除、修改、恢复记忆，\n"
+            f"[bionic-agent-admin] ⚠ 可以恢复整库快照、导出备份包、改动治理状态。\n"
+            f"[bionic-agent-admin] ⚠ 请确认你处在可信网络（例如自己的隔离内网），\n"
+            f"[bionic-agent-admin] ⚠ 并且不要把这个端口暴露到公网。\n"
+            f"[bionic-agent-admin] ⚠ --allow-remote 只是你的授权声明，不是认证。"
+        )
+
+    return False, (
+        f"[bionic-agent-admin] 拒绝启动：--host {host} 不是本机地址。\n"
+        f"[bionic-agent-admin] 管理面板没有任何身份认证，直接绑定到非本机地址，\n"
+        f"[bionic-agent-admin] 等于把「删记忆 / 恢复整库 / 导出备份」的接口交给同网段所有人。\n"
+        f"[bionic-agent-admin] \n"
+        f"[bionic-agent-admin] 如果你只是想换个端口：--port 9000（host 保持默认 127.0.0.1）。\n"
+        f"[bionic-agent-admin] 如果你确实要暴露到局域网，请显式加 --allow-remote：\n"
+        f"[bionic-agent-admin]     python -m app.admin_ui --host {host} --allow-remote"
+    )
+
+
 def _run_cli():
     parser = argparse.ArgumentParser(description="Bionic Agent 管理面板")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8899)
+    parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="允许绑定非本机地址（面板无身份认证，暴露到局域网前请确认风险）",
+    )
     args = parser.parse_args()
+
+    # 这一步必须发生在任何数据库动作之前：_lifespan 里的 _ensure_db() 会建库/迁移，
+    # 所以在 uvicorn.run 之前就把"不该起来"的情况挡掉，被拒绝时进程里没有过任何
+    # 数据库初始化，也就不会有任何生产数据被触碰。
+    allowed, message = check_bind_safety(args.host, args.allow_remote)
+    if not allowed:
+        print(message, file=sys.stderr)
+        sys.exit(2)
+    if message:
+        print(message, file=sys.stderr)
+
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

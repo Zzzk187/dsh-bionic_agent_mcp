@@ -64,6 +64,42 @@ MIN_CHUNK_CHARS = 40
 
 MODEL_NAME = embeddings.DEFAULT_MODEL
 
+# ---------------------------------------------------------------------------
+# The system's own skeleton (added 2026-11-08, when the local dsh-memory system
+# was merged into MCP wholesale).
+#
+# These files were deliberately left out of the first import, and the reason was
+# sound at the time: 卷/ is mirrored row-by-row into `memories`, so importing it
+# here puts the same text in two tables with two origins. But the merge exposed
+# the cost of that choice -- a `memories` table answers a question only if you
+# already know which row to open. "我有哪些硬约定" and "记忆库怎么备份" got zero
+# hits, because the files that answer them were not in the index at all.
+#
+# So the trade-off is now the other way round, with the duplication accepted and
+# named: the `memories` row stays authoritative (that is what 记忆.jsonl syncs
+# into), and these documents are the retrieval-facing view of the same text.
+# They are separate roots, not notes, because they are not notes -- they are the
+# machine, and a query that wants a note usually does not want the machinery.
+# Paths are relative to the dsh-memory root, with forward slashes. They were
+# flat filenames until 2026-11-08, when the directory was modularised into
+# bin/ lib/ data/ docs/ var/; keeping the old names here silently turned 22
+# indexed documents into missing_on_disk -- the index still answered queries
+# with text that no longer existed on disk, which is worse than a plain miss.
+SKELETON_FILES = (
+    "约定.md", "性格.md", "记忆.md", "记忆索引.md",      # 唤醒面：故意留在顶层
+    "docs/体系.md", "docs/MAP.md", "docs/README.md",
+)
+SKELETON_DIRS = ("卷",)
+SKELETON_SCRIPTS = (
+    "bin/查.ps1", "bin/检查记忆.ps1", "bin/待办.ps1", "bin/备份.ps1",
+    "bin/检索统计.ps1", "bin/生成索引.ps1", "bin/知识检索.ps1",
+    "bin/自检.ps1", "bin/记忆写入.ps1", "bin/记忆检索.ps1",
+    # 2026-11-08 模块化后新增：这两个文件才是"路径与 I/O 从哪来"的答案
+    "config.ps1", "lib/Common.ps1",
+)
+SKELETON_ROOT = "memory"
+SCRIPT_ROOT = "script"
+
 
 # ---------------------------------------------------------------------------
 # Chunking
@@ -149,12 +185,67 @@ def split_sections(text: str) -> list[tuple[str, str]]:
 # Discovery
 # ---------------------------------------------------------------------------
 
-def discover(root: str | None = None) -> list[dict]:
-    """Walk knowledge/ and mine/ and return the importable document list.
+def _skeleton_docs(root: str) -> list[dict]:
+    """The system's own files: wake-chain pages, 卷/, AGENTS.md, and the scripts.
 
-    Deliberately does NOT read 卷/ -- those four files are already represented
-    row-by-row in `memories` (mirrored from 记忆.jsonl), and importing them here
-    would put the same text in two places with two different origins.
+    Kept out of the knowledge/mine walk for two reasons: they are outside those
+    two directories, and mixing them into the same root would let the machinery
+    outrank the notes (a query about 备份 should be able to find 备份.ps1, but a
+    query about 显存 should never be answered by it).
+    """
+    out: list[dict] = []
+
+    def _add(full: str, rel: str, root_name: str, domain: str) -> None:
+        try:
+            st = os.stat(full)
+        except OSError:
+            return
+        out.append({
+            "path": os.path.abspath(full),
+            "rel_path": rel,
+            "root": root_name,
+            "domain": domain,
+            # [S0/P1-1] 稳定的源根 + 相对路径：跨设备重锚靠这两个字段，
+            # 绝对路径只作展示与读取入口，不再当幂等键。
+            "source_root": os.path.abspath(root),
+            "source_rel": rel,
+            "byte_size": st.st_size,
+            "mtime": int(st.st_mtime),
+        })
+
+    def _rel(rel: str) -> str:
+        return os.path.join(root, *rel.split("/"))   # 清单里写 '/'，落盘要本地分隔符
+
+    for name in SKELETON_FILES:
+        _add(_rel(name), name, SKELETON_ROOT, "")
+    # AGENTS.md sits one level up from dsh-memory; it is the file the host
+    # injects into every request, so it is the single most load-bearing text in
+    # the whole system and must be searchable.
+    # [S0/P1-1] rel_path 显式写成 ../AGENTS.md，如实反映它在 dsh-memory
+    # 上一级；既避免与卷/ 下的同名文件混淆，也让重锚端能算回真实位置。
+    _add(os.path.join(os.path.dirname(root), "AGENTS.md"), "../AGENTS.md", SKELETON_ROOT, "")
+    for sub in SKELETON_DIRS:
+        base = os.path.join(root, sub)
+        if not os.path.isdir(base):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(base):
+            for name in sorted(filenames):
+                if not name.lower().endswith(".md"):
+                    continue
+                full = os.path.join(dirpath, name)
+                _add(full, os.path.join(sub, os.path.relpath(full, base)), SKELETON_ROOT, sub)
+    for name in SKELETON_SCRIPTS:
+        _add(_rel(name), name, SCRIPT_ROOT, "")
+    return out
+
+
+def discover(root: str | None = None) -> list[dict]:
+    """Walk knowledge/, mine/, and the system skeleton; return the importable list.
+
+    The original version deliberately did NOT read 卷/ -- those four files are
+    mirrored row-by-row into `memories`. That decision was overturned on
+    2026-11-08 (see SKELETON_FILES): the mirror answers a question only when you
+    already know which row to open, so the same text is now also indexed here.
     """
     root = root or DSH_MEMORY_ROOT
     docs: list[dict] = []
@@ -182,10 +273,15 @@ def discover(root: str | None = None) -> list[dict]:
                     "rel_path": rel,
                     "root": sub,
                     "domain": domain,
+                    # [S0/P1-1] 与 _skeleton_docs 同一口径：相对 dsh-memory 根。
+                    # 这样重锚时 new_path = new_root / source_rel 对两类文档都成立。
+                    "source_root": os.path.abspath(root),
+                    "source_rel": os.path.relpath(full, root),
                     "byte_size": st.st_size,
                     "mtime": int(st.st_mtime),
                 })
-    return docs
+    # Skeleton last: if a rel_path ever collides, the note-shaped import wins.
+    return docs + _skeleton_docs(root)
 
 
 # ---------------------------------------------------------------------------
@@ -251,10 +347,19 @@ def import_docs(root: str | None = None, *, dry_run: bool = False,
 
     with db.connect() as conn:
         for doc in prepared:
+            # [S0/P1-1] 稳定键 (root, rel_path) 优先；绝对路径只作兼容回退。
+            # 换机器/换盘符后同一文档识别为"更新"而非"新增+孤儿"；回退同时
+            # 平滑迁移 AGENTS.md 的 rel_path "AGENTS.md" → "../AGENTS.md"
+            # （命中后下面的 UPDATE 会把两列都刷新为新值，不产生重复行）。
             row = conn.execute(
-                "SELECT id, content_hash FROM knowledge_docs WHERE path = ?",
-                (doc["path"],),
+                "SELECT id, content_hash FROM knowledge_docs WHERE root = ? AND rel_path = ?",
+                (doc["root"], doc["rel_path"]),
             ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    "SELECT id, content_hash FROM knowledge_docs WHERE path = ?",
+                    (doc["path"],),
+                ).fetchone()
             if row is not None and row["content_hash"] == doc["content_hash"]:
                 stats["docs_unchanged"] += 1
                 continue
@@ -285,12 +390,14 @@ def import_docs(root: str | None = None, *, dry_run: bool = False,
                 stats["chunks_deleted"] += int(old)
                 conn.execute("DELETE FROM knowledge_chunks WHERE doc_id = ?", (doc_id,))
                 conn.execute(
-                    "UPDATE knowledge_docs SET rel_path=?, root=?, domain=?, title=?, content=?,"
-                    " content_hash=?, byte_size=?, mtime=?, chunk_count=?,"
+                    # [S0/P1-1] 同时刷新 path：稳定键命中但路径已变（换机器）时，
+                    # 把绝对路径重锚到本机；内容未变也更新，避免下次仍判 changed。
+                    "UPDATE knowledge_docs SET path=?, rel_path=?, root=?, domain=?, title=?,"
+                    " content=?, content_hash=?, byte_size=?, mtime=?, chunk_count=?,"
                     " updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (doc["rel_path"], doc["root"], doc["domain"], doc["title"], doc["content"],
-                     doc["content_hash"], doc["byte_size"], doc["mtime"], len(doc["sections"]),
-                     doc_id),
+                    (doc["path"], doc["rel_path"], doc["root"], doc["domain"], doc["title"],
+                     doc["content"], doc["content_hash"], doc["byte_size"], doc["mtime"],
+                     len(doc["sections"]), doc_id),
                 )
 
             chunk_ids: list[int] = []
@@ -493,9 +600,31 @@ def _parse_query(text: str) -> tuple[list[str], list[str]]:
         if key in low or low in key:
             terms.extend(group)
 
-    # CJK bigrams are deliberately NOT terms: `知识检索.ps1` uses them only as the
-    # `min(6, bg) * 1.6` bonus below. Listing them as terms too scored every
-    # bigram twice and cost 2 of 38 first-place hits when measured.
+    # CJK bigrams from *short* queries are deliberately NOT terms:
+    # `知识检索.ps1` uses them only as the `min(6, bg) * 1.6` bonus below.
+    # Listing them as terms too scored every bigram twice and cost 2 of 38
+    # first-place hits when measured.
+    #
+    # That measurement was taken on the 38-case benchmark, which is made of
+    # short keyword queries ("上下文坍缩", "切分 召回"). Real questions are
+    # whole sentences, and a sentence is one whitespace-delimited token, so
+    # the tokenizer above yields exactly one term for it and every section
+    # containing that missing substring scores zero -- "插件装完没反应是为什么"
+    # ranked `多 Agent 编排` first and `DSH 插件开发` third, because all of
+    # them scored 1.08 and nothing separated them. So: expand bigrams only
+    # from parts long enough to be a sentence (>= 6 CJK chars). Short keyword
+    # queries keep the old path untouched, which is why the benchmark stays
+    # identical (measured: 34/38 by single-file criterion, same before and
+    # after; the four misses are cases whose accepted answer is a *set* of
+    # files and this criterion only reads the first).
+    for part in originals:
+        if len(part) < 6 or not re.search(r"[\u4e00-\u9fff]", part):
+            continue
+        chars = list(part)
+        for i in range(len(chars) - 1):
+            bg = chars[i] + chars[i + 1]
+            if re.fullmatch(r"[\u4e00-\u9fff]{2}", bg) and bg not in terms:
+                terms.append(bg)
 
     seen: list[str] = []
     for t in terms:
@@ -968,6 +1097,103 @@ def get_chunk(chunk_id: int) -> dict:
     return {"ok": True, "chunk": dict(row)}
 
 
+def prune_missing(root: str | None = None, *, dry_run: bool = True) -> dict:
+    """Delete knowledge_docs rows whose file is gone AND whose text survives elsewhere.
+
+    A moved file (体系.md -> docs/体系.md) leaves the old path behind: `import_docs`
+    is keyed on `path`, so it inserts the new row and never touches the old one.
+    Leaving it means search still surfaces a document whose source no longer exists
+    -- worse than a plain miss, because the snippet looks authoritative.
+
+    But "in db, not on disk" is also what a genuinely deleted note looks like, and
+    that note may be the only copy. So deletion requires proof of a move: a live
+    document with the same basename. No such twin -> report only, never delete.
+    """
+    root = root or DSH_MEMORY_ROOT
+
+    def _norm_rel(r, rel):
+        # [S0/P1-1] legacy AGENTS.md 归一化（同 drift）。
+        rel = rel or ""
+        if r == "memory" and rel == "AGENTS.md":
+            rel = "../AGENTS.md"
+        return rel
+
+    # [S0/P1-1] 用稳定键判定"文档还在不在"，不再用绝对路径：换机器/盘符后
+    # 路径全变但 (root, rel_path) 不变，不应把整套库误判成 missing。
+    on_disk = {
+        (d["root"], _norm_rel(d["root"], d["rel_path"])) for d in discover(root)
+    }
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT id, path, rel_path, root, content_hash FROM knowledge_docs ORDER BY id"
+        ).fetchall()
+
+    # 判据是"同名文件搬了家"，不是"内容一字没变"：模块化那次连内容一起改了，
+    # 用 hash 比会把每个改过的脚本都判成唯一副本，一个也删不掉。
+    # 证据要两条同时成立：root 相同（同一类资产内部搬动）+ basename 相同（同一个文件）。
+    # 只比 basename 会撞巧合：memory/README.md 搬去 docs/ 的同时，mine/ 下也有个
+    # README.md，它的 rel_path 恰好也是 "README.md"，于是旧行被"证明"搬去了那儿。
+    key = lambda root, rel: (root, os.path.basename(rel or ""))
+    live_home: dict[tuple, list[str]] = {}
+    for r in rows:
+        if (r["root"], _norm_rel(r["root"], r["rel_path"])) in on_disk:
+            live_home.setdefault(key(r["root"], r["rel_path"]), []).append(r["rel_path"])
+
+    missing = [
+        r for r in rows
+        if (r["root"], _norm_rel(r["root"], r["rel_path"])) not in on_disk
+    ]
+    removable, kept = [], []
+    for r in missing:
+        rel = r["rel_path"] or os.path.basename(r["path"])
+        homes = live_home.get(key(r["root"], rel), [])
+        if not homes:
+            kept.append({"doc_id": r["id"], "path": r["path"], "rel_path": rel,
+                         "reason": "同 root 下已没有同名文件，可能是唯一副本，不删"})
+            continue
+        removable.append({"doc_id": r["id"], "path": r["path"], "rel_path": rel,
+                          "why": "同名文件已搬到 " + "、".join(homes)})
+
+    stats = {
+        "ok": True,
+        "dry_run": dry_run,
+        "missing_total": len(missing),
+        "removable": removable,
+        "kept": kept,
+        "deleted_docs": 0,
+        "deleted_chunks": 0,
+        "deleted_vectors": 0,
+    }
+    if dry_run or not removable:
+        return stats
+
+    with db.connect() as conn:
+        for item in removable:
+            doc_id = item["doc_id"]
+            vec_n = conn.execute(
+                "SELECT COUNT(*) AS n FROM knowledge_embeddings WHERE chunk_id IN"
+                " (SELECT id FROM knowledge_chunks WHERE doc_id = ?)", (doc_id,)
+            ).fetchone()["n"]
+            chunk_n = conn.execute(
+                "SELECT COUNT(*) AS n FROM knowledge_chunks WHERE doc_id = ?", (doc_id,)
+            ).fetchone()["n"]
+            conn.execute(
+                "DELETE FROM knowledge_embeddings WHERE chunk_id IN"
+                " (SELECT id FROM knowledge_chunks WHERE doc_id = ?)", (doc_id,))
+            conn.execute("DELETE FROM knowledge_chunks WHERE doc_id = ?", (doc_id,))
+            conn.execute("DELETE FROM knowledge_docs WHERE id = ?", (doc_id,))
+            stats["deleted_vectors"] += int(vec_n)
+            stats["deleted_chunks"] += int(chunk_n)
+            stats["deleted_docs"] += 1
+        conn.execute(
+            "INSERT INTO events (task_id, event_type, detail) VALUES (0,?,?)",
+            ("knowledge.pruned",
+             f"missing={len(missing)} deleted={stats['deleted_docs']}"
+             f" kept={len(kept)} chunks={stats['deleted_chunks']}"),
+        )
+    return stats
+
+
 def status() -> dict:
     """Coverage report: what is imported, what has vectors, what drifted."""
     with db.connect() as conn:
@@ -1007,25 +1233,40 @@ def drift(root: str | None = None) -> dict:
       * hash differs           -> the file changed, needs re-import
     """
     root = root or DSH_MEMORY_ROOT
-    on_disk = {os.path.abspath(d["path"]): d for d in discover(root)}
+
+    def _key(r, rel):
+        # [S0/P1-1] 稳定键 (root, rel_path)；legacy AGENTS.md 曾以
+        # "AGENTS.md" 入库，归一化到当前 "../AGENTS.md"，避免误判 missing+added。
+        rel = rel or ""
+        if r == "memory" and rel == "AGENTS.md":
+            rel = "../AGENTS.md"
+        return (r, rel)
+
+    on_disk = {_key(d["root"], d["rel_path"]): d for d in discover(root)}
     with db.connect() as conn:
-        rows = conn.execute("SELECT id, path, content_hash FROM knowledge_docs").fetchall()
-    in_db = {r["path"]: {"id": r["id"], "content_hash": r["content_hash"]} for r in rows}
+        rows = conn.execute(
+            "SELECT id, path, root, rel_path, content_hash FROM knowledge_docs"
+        ).fetchall()
+    in_db = {
+        _key(r["root"], r["rel_path"]):
+            {"id": r["id"], "content_hash": r["content_hash"], "path": r["path"]}
+        for r in rows
+    }
 
     added, changed, missing = [], [], []
-    for path, meta in on_disk.items():
-        if path not in in_db:
+    for key, meta in on_disk.items():
+        if key not in in_db:
             added.append(meta["rel_path"])
             continue
         try:
-            text = _read_text(path)
+            text = _read_text(meta["path"])   # 读本机当前路径，换盘符后依然读得到
         except OSError:
             continue
-        if hashlib.sha256(text.encode("utf-8")).hexdigest() != in_db[path]["content_hash"]:
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != in_db[key]["content_hash"]:
             changed.append(meta["rel_path"])
-    for path, info in in_db.items():
-        if path not in on_disk:
-            missing.append({"doc_id": info["id"], "path": path})
+    for key, info in in_db.items():
+        if key not in on_disk:
+            missing.append({"doc_id": info["id"], "path": info["path"]})
 
     return {
         "ok": True,
@@ -1036,3 +1277,86 @@ def drift(root: str | None = None) -> dict:
         "missing_on_disk": missing,
         "in_sync": not added and not changed and not missing,
     }
+
+
+def reanchor_paths(new_root: str, *, dry_run: bool = True) -> dict:
+    """[S0/P1-1] 把知识文档的绝对路径从旧 dsh-memory 根重锚到 ``new_root``。
+
+    跨设备迁移后，库里 ``knowledge_docs.path`` 仍是旧机器的绝对路径（历史幂等
+    锚点），会导致 ``drift()`` 把整套库报成 missing_on_disk。本函数按稳定键
+    ``(root, rel_path)`` 找到新根下的对应文件，校验内容 hash 未变后，只重写
+    ``path`` 这一列——不碰内容、rel_path、root、chunk、向量和治理状态。
+
+    四类结果：reanchored（路径已改）、unchanged（本来就指向新路径）、
+    conflicts（新路径存在但 hash 变了，应 reimport 而非重锚）、
+    missing（新根下找不到该文件）。写入走单个 ``db.transaction()``，任何
+    异常整单回滚；``dry_run=True`` 只计算不落库。
+    """
+    new_root = os.path.abspath(new_root)
+    report: dict = {
+        "ok": True,
+        "dry_run": dry_run,
+        "new_root": new_root,
+        "reanchored": [],
+        "unchanged": [],
+        "conflicts": [],
+        "missing": [],
+        "errors": [],
+    }
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT id, path, root, rel_path, content_hash FROM knowledge_docs ORDER BY id"
+        ).fetchall()
+
+    updates: list[tuple] = []
+    for r in rows:
+        root = r["root"] or ""
+        rel = r["rel_path"] or ""
+        if root == "memory" and rel == "AGENTS.md":  # legacy 归一化
+            rel = "../AGENTS.md"
+        if root in ("knowledge", "mine"):
+            target = os.path.abspath(os.path.join(new_root, root, rel))
+        elif root in ("memory", "script"):
+            # skeleton / scripts 的 rel_path 相对 dsh-memory 根；
+            # ../AGENTS.md 自然解析到父目录，与 _skeleton_docs 一致。
+            target = os.path.abspath(os.path.join(new_root, rel))
+        else:
+            report["conflicts"].append({"doc_id": r["id"], "path": r["path"],
+                                        "reason": "未知 root: %s" % root})
+            continue
+        if not os.path.isfile(target):
+            report["missing"].append({"doc_id": r["id"], "old_path": r["path"],
+                                      "expected": target, "rel_path": rel})
+            continue
+        try:
+            text = _read_text(target)
+        except OSError as exc:
+            report["errors"].append({"doc_id": r["id"], "path": target,
+                                     "error": str(exc)[:200]})
+            continue
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if digest != r["content_hash"]:
+            report["conflicts"].append({
+                "doc_id": r["id"], "path": target, "rel_path": rel,
+                "reason": "内容 hash 已变，应 reimport 而非重锚",
+            })
+            continue
+        if os.path.abspath(r["path"]) == target:
+            report["unchanged"].append({"doc_id": r["id"], "path": target})
+            continue
+        updates.append((r["id"], target))
+        report["reanchored"].append({"doc_id": r["id"], "old_path": r["path"],
+                                     "new_path": target, "rel_path": rel})
+
+    report["planned"] = len(updates)
+    if dry_run or not updates:
+        return report
+    try:
+        with db.transaction() as conn:
+            for doc_id, target in updates:
+                conn.execute("UPDATE knowledge_docs SET path=? WHERE id=?", (target, doc_id))
+    except Exception as exc:
+        report["ok"] = False
+        report["reanchored"] = []
+        report["errors"].append({"error": "重锚事务失败，已回滚: " + str(exc)[:200]})
+    return report
