@@ -21,6 +21,7 @@ from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+import _env_guard  # noqa: E402,F401  OPT-04a：数据库隔离闸门（必须在任何 app.* 之前）
 
 from app import db as app_db            # noqa: E402
 from app import portable_backup as pb   # noqa: E402
@@ -33,6 +34,31 @@ PASS = 0
 FAIL = 0
 _TMPS: list[Path] = []
 VALID_PID = "bionic-memory-test"   # 格式合法但无需文件存在（工具层只做路径边界解析）
+
+# registry 基线：在**导入这一刻**取，arch 组再比。
+# 这里原来钉的是绝对时间上界 `0 < mt < 1795000000`（= 2026-11-18），本意是
+# 「本次运行没动 registry」，写法却变成「registry 必须在某个日期之前」——
+# 宿主注册新 MCP 服务器时（2026-11-21 加了 snowluma / web-search-host 等）
+# 它必然失败，且失败原因与测试对象毫无关系。改成运行时取基线再比，
+# 语义回到本意，且比原来更强：原来是「早于某个日期」，现在是「跑这一遍没变」。
+REGISTRY_PATH = Path(r"C:\Users\xing\.dsh\skill-mcp-manager\registry.json")
+
+
+def _registry_stamp() -> tuple[float, int, str]:
+    """(mtime, size, sha256)；文件不存在时返回 (0, 0, "")。"""
+    try:
+        st = REGISTRY_PATH.stat()
+    except OSError:
+        return (0.0, 0, "")
+    import hashlib
+    try:
+        digest = hashlib.sha256(REGISTRY_PATH.read_bytes()).hexdigest()
+    except OSError:
+        digest = ""
+    return (st.st_mtime, st.st_size, digest)
+
+
+REGISTRY_BASELINE = _registry_stamp()
 
 
 def check(name, cond, detail=""):
@@ -166,8 +192,17 @@ def group_safety():
         r = srv.restore_memory_package("R15", "stale-token", VALID_PID)
         check("15 目标变化后令牌工具层止步", r["ok"] is False and me.call_count == 0)
     # 工具绝不自行生成令牌：confirm 只接收传入 token，不调用 _issue_token
-    check("15b 工具不含令牌签发逻辑", "_issue_token" not in Path(srv.__file__).read_text(encoding="utf-8")
-          .split("def _pkg_path")[1].split("def _run(")[0])
+    #
+    # OPT-03 3.1 把 85 个工具从 app/mcp_server.py 拆到 app/mcp/{core,gov}_tools.py，
+    # 原来这里用 `srv.__file__` 截取「_pkg_path 到 _run」之间的源码取证——那段代码
+    # 已经搬到 gov_tools.py，`srv.__file__` 现在是 10 行 shim，截取必然越界。
+    # 断言的**语义没变**（工具层不得自行签发令牌），而且比原先更强：原先是只看
+    # 那一段，现在扫两个工具实现文件的全文。
+    _tool_srcs = [PROJECT_ROOT / "app" / "mcp" / f for f in ("core_tools.py", "gov_tools.py")]
+    _hit = [p.name for p in _tool_srcs if "_issue_token" in p.read_text(encoding="utf-8")]
+    check("15b 工具不含令牌签发逻辑",
+          all(p.is_file() for p in _tool_srcs) and not _hit,
+          f"扫 {[p.name for p in _tool_srcs]}，命中 {_hit}")
 
     # 16 source_only 全系统替换：工具原样传播 S2 blockers，不绕过
     with mock.patch.object(srv._prestore, "preview_restore",
@@ -256,9 +291,19 @@ def group_arch():
           hasattr(srv, "mcp") and hasattr(srv, "mcp_gov")
           and "FastMCP(" not in gov_src
           and "mcp_server._run(mcp_server.mcp_gov" in gov_src)
-    reg = Path(r"C:\Users\xing\.dsh\skill-mcp-manager\registry.json")
-    mt = reg.stat().st_mtime if reg.exists() else 0
-    check("23 registry 未被本次修改（mtime 保持旧值）", 0 < mt < 1795000000, str(mt))
+    # 23 原来钉死 `0 < mt < 1795000000`（2026-11-18 的绝对上界），宿主在
+    # 2026-11-21 注册新 MCP 服务器后它必然失败——那是「registry 必须在某个
+    # 日期之前」，不是「本次运行没改 registry」。改成跑这一遍前后比对：
+    # mtime / size / sha256 三者全等才算没动过（只比 mtime 会被
+    # 同秒内的改写骗过去；只比 size 会被等长改写骗过去）。
+    current = _registry_stamp()
+    existed = REGISTRY_BASELINE[0] > 0
+    check("23 registry 未被本次修改（运行期间指纹不变）",
+          current == REGISTRY_BASELINE,
+          f"baseline={REGISTRY_BASELINE} current={current}")
+    check("23b registry 可读（存在且非空）",
+          (not existed) or (REGISTRY_BASELINE[1] > 0 and REGISTRY_BASELINE[2] != ""),
+          f"exists={existed} size={REGISTRY_BASELINE[1]} sha={REGISTRY_BASELINE[2][:16]}")
     core_names = {t.name for t in asyncio.run(srv.mcp.list_tools())}
     gov_names = {t.name for t in asyncio.run(srv.mcp_gov.list_tools())}
     check("24 原有工具回归（标志性老工具在）",

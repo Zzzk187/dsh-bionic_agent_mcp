@@ -8,10 +8,18 @@
        bionic-agent-admin               (pyproject 注册的控制台入口)
        python -m app.admin_ui --port 9000          (只换端口，仍只监听本机)
 
-安全:  面板没有任何身份认证，默认只绑定 127.0.0.1。
-       绑定非本机地址（0.0.0.0 / 192.168.x.x / 机器名）会**拒绝启动**，
-       必须显式加 --allow-remote 表示你知道后果：
+身份认证（可选，默认关闭）:
+       不配令牌时行为与历史版本完全一致：面板没有任何认证，只监听 127.0.0.1。
+       配了令牌后（--token 或环境变量 BIONIC_ADMIN_TOKEN），除首页 `/` 与
+       `/static/*` 之外的所有接口都要求 `Authorization: Bearer <token>`，
+       未认证一律 401 —— 包括全部 /api 读写、备份、恢复、快照接口。
+
+安全:  默认只绑定 127.0.0.1。绑定非本机地址（0.0.0.0 / 192.168.x.x /
+       机器名）会**拒绝启动**，必须显式加 --allow-remote 表示你知道后果：
        python -m app.admin_ui --host 0.0.0.0 --allow-remote
+       绑定授权与令牌认证是**两件独立的事**，互相不能替代：--allow-remote 只是
+       "我愿意暴露"的声明、不是认证；令牌是认证、不能替代远程绑定授权。
+       python -m app.admin_ui --host 0.0.0.0 --allow-remote --token <令牌>
 
 前端是一个零外部依赖的自包含 HTML（app/admin_ui.html），离线可用；
 语义检索复用 bionic 已缓存的本地 FastEmbed 模型，不联网。
@@ -19,6 +27,7 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import ipaddress
 import json
 import os
@@ -54,6 +63,7 @@ from app import feedback_loop as feedback  # noqa: E402
 # S4：复用 S1 便携包 / S2 恢复引擎，面板不重写任何业务逻辑。
 from app import portable_backup as pbackup  # noqa: E402
 from app import portable_restore as prestore  # noqa: E402
+from app import panel_queries as panelq  # noqa: E402
 from app.db import rowdict as db_rowdict  # noqa: E402
 
 HTML_PATH = Path(__file__).resolve().with_name("admin_ui.html")
@@ -65,6 +75,14 @@ HTML_PATH = Path(__file__).resolve().with_name("admin_ui.html")
 # 却报「浏览器半跑起来了」。带上 boot 之后，自检只认「和当前服务同一实例」的
 # 报到，重启后的旧记录自动失效。
 BOOT_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+# 服务身份标记（跨启动稳定，故意不带 pid）。
+#
+# 用途只有一个：让**没有令牌**的探活方（DSH 面板插件的 identifyAdmin、
+# verify-install.mjs 的端口扫描）能分辨「这是我的管理服务，只是要认证」和
+# 「8899 上坐着别人的程序」。值写死不跟 BOOT_ID 走 —— 后者每次重启都变，
+# 探活方拿它做不了身份判断，只能当实例比对用。
+SERVICE_ID = "bionic-agent-admin"
 
 
 @asynccontextmanager
@@ -83,6 +101,164 @@ async def _lifespan(_app):
 
 
 app = FastAPI(title="Bionic Agent 管理面板", version="0.1.0", lifespan=_lifespan)
+
+
+# ---------------------------------------------------------------------------
+# 可选的身份认证（默认关闭：不配令牌时行为与历史版本完全一致）
+# ---------------------------------------------------------------------------
+#
+# 三个设计取舍，都是实测后才定下来的：
+#
+# 1. 用 Authorization 头，不用 Cookie / Session。
+#    CORS 现在是 allow_credentials=False，改成 Cookie 就必须同时打开它、并把
+#    来源 regex 收紧到具体 origin —— 那是**扩大**攻击面，不是缩小。而面板前端
+#    所有业务请求都过同一个 `api()` 函数（见 admin_ui.html），加一个头就全量
+#    覆盖，不存在"逐个 fetch 漏改"。
+#
+# 2. 令牌只活在服务端内存里，不进 URL、不进日志、不写库、不进异常信息。
+#    放 URL 会被浏览器历史、Referer 头、反代访问日志三处留存，所以明确拒绝
+#    查询参数与 GET 参数两种传法。
+#
+# 3. 用统一中间件，不给 75 条路由逐条加依赖。
+#    路由全部是模块级 `@app.get/post` 直挂、没有 APIRouter；逐条加不仅会漏，
+#    而且以后新增路由时"忘了加"就等于默认放行。默认失败更安全。
+ADMIN_TOKEN_ENV = "BIONIC_ADMIN_TOKEN"
+
+# 当前生效的令牌。空串 = 认证关闭。
+#
+# 为什么是可变全局而不是闭包里的常量：`uvicorn.run(app)` 用的是 import 那一刻
+# 就建好的 app，中间件早已注册；而 `--token` 只有在 `_run_cli()` 里才解析得到。
+# 所以"认证开没开"必须是每次请求现读的状态，不能固化进闭包（否则测试也没法翻）。
+#
+# 初值从环境变量取，是为了让"不走 _run_cli 的启动方式"（uvicorn app.admin_ui:app
+# 之类）也认 BIONIC_ADMIN_TOKEN —— 否则环境变量只在 CLI 路径下生效，等于半个功能。
+_ADMIN_TOKEN = os.environ.get(ADMIN_TOKEN_ENV, "").strip()
+
+
+def token_problem(token: str) -> str:
+    """检查令牌是否可用；可用返回空串，不可用返回原因。
+
+    要求调用方先 strip：首尾空白在这里**不算错**（HTTP 头值本来就不含首尾空格，
+    而粘贴时带上空格是常态），裁掉即可，不必让使用者去修引号。
+
+    为什么必须有这一步（实测踩到）：HTTP 头值只能是 ASCII。中文令牌在浏览器和
+    httpx 里都会在**发请求之前**就抛 UnicodeEncodeError —— 也就是说服务端
+    "配上了令牌"，客户端却根本发不出来，现场表现是"面板全 401，但令牌明明
+    复制对了"。这种"配了等于没配、还查不出原因"的配置必须启动时当场拒掉。
+
+    顺带挡掉控制字符：粘贴时同样容易带上不可见字符。
+    """
+    if not token:
+        return ""
+    for ch in token:
+        code = ord(ch)
+        if code < 0x20 or code == 0x7F:
+            return f"令牌含控制字符 U+{code:04X}"
+    try:
+        token.encode("ascii")
+    except UnicodeEncodeError:
+        bad = next(c for c in token if ord(c) > 0x7E)
+        return (f"令牌含非 ASCII 字符 {bad!r}（U+{ord(bad):04X}）：HTTP 头只能放 "
+                f"ASCII，浏览器发不出这种令牌。请改用 ASCII 字符（字母数字与 -_.~ 等）")
+    return ""
+
+
+def configure_auth(token: str | None = None) -> str:
+    """设置当前进程的访问令牌，返回生效值。空串 = 关闭认证。
+
+    `token=None` 表示"不覆盖"，此时回落到环境变量 BIONIC_ADMIN_TOKEN。
+    优先级：--token（显式传值） > BIONIC_ADMIN_TOKEN > 未配置。
+
+    非法令牌会抛 ValueError 而不是静默降级成"认证关闭" —— 后者会让人以为
+    自己开了认证、实际裸奔。CLI 路径自己先做一次校验，所以正常启动走不到这里。
+    """
+    global _ADMIN_TOKEN
+    raw = os.environ.get(ADMIN_TOKEN_ENV, "") if token is None else token
+    value = str(raw).strip()
+    problem = token_problem(value)
+    if problem:
+        raise ValueError(problem)
+    _ADMIN_TOKEN = value
+    return _ADMIN_TOKEN
+
+
+def auth_enabled() -> bool:
+    """当前是否启用了令牌认证。"""
+    return bool(_ADMIN_TOKEN)
+
+
+def is_public_path(path: str) -> bool:
+    """不需要令牌就能访问的路径（白名单，只有两类）。
+
+    - `/`：面板自身的 HTML。它不含任何业务数据，而且**必须公开** —— 否则没人
+      能打开页面，也就没地方输入令牌了（令牌明确禁止走 URL 查询参数）。页面里
+      发出的每一个 /api 请求仍然要过认证，认证失败时前端会就地要求输入令牌。
+    - `/static/*`：星图用的 3d-force-graph（MIT，1.39 MB）与图标。同样是公开库
+      文件、不含数据。真正的越权读由 `static_file` 自己的后缀白名单与 `..` 拦截
+      负责，这里只负责不把静态资源卡在认证后面。
+    """
+    if path == "/":
+        return True
+    return path.startswith("/static/")
+
+
+@app.middleware("http")
+async def _auth_gateway(request: Request, call_next):
+    """未配置令牌时直接放行；配置后除白名单外一律要求 Bearer。
+
+    刻意不区分"没带令牌 / 令牌错 / 令牌是空串"：统一一句话，不把任何"错在
+    哪一步"的信息还给调用方。状态码用 401 而不是 403 —— 403 的语义是"认证
+    通过了但不允许"，这里根本没认证成功过。
+    """
+    if not auth_enabled():
+        return await call_next(request)
+
+    path = request.url.path
+    method = request.method.upper()
+
+    # CORS 预检本身不带凭据；若被认证挡掉，浏览器连 401 都读不到，只会报
+    # CORS 错误，前端就没法提示"你该输令牌了"。
+    if method == "OPTIONS" or is_public_path(path):
+        return await call_next(request)
+
+    presented = ""
+    header = request.headers.get("authorization", "")
+    scheme, _, rest = header.partition(" ")
+    if scheme.lower() == "bearer":
+        presented = rest.strip()
+
+    # 用 compare_digest 而不是 == 是为了恒定时间比较（不被计时侧信道逐字节
+    # 猜令牌）。两边统一编成 bytes：str 版只接受 ASCII，用 bytes 就不必依赖
+    # "令牌一定是 ASCII"这个前置校验，少一处会随将来改动而失效的隐含假设。
+    ok = bool(presented) and hmac.compare_digest(
+        presented.encode("utf-8"), _ADMIN_TOKEN.encode("utf-8")
+    )
+    if ok:
+        # 认证通过的响应也带身份标记。不加的话，调用方要判"这是不是我"
+        # 就得走两条完全不同的逻辑：401 看头、200 看 body 形状。而 body
+        # 形状是会随版本变的东西（多加/改名一个字段就误判），响应头是契约。
+        response = await call_next(request)
+        response.headers["X-Bionic-Service"] = SERVICE_ID
+        return response
+
+    return JSONResponse(
+        content={"ok": False, "message": "需要访问令牌（Authorization: Bearer <token>）"},
+        status_code=401,
+        # 401 里带上服务身份标记，是给「探活但拿不到令牌」的调用方用的：
+        # 外部插件必须能在**没有令牌**的前提下分辨「这是我自己的管理服务、
+        # 只是要认证」还是「8899 上坐着别人的程序」。没有这个标记时，它只能
+        # 看到一句 401，于是把本服务误判成"端口被占"、换个端口再起一个，
+        # 结果就是同一台机器上跑出两个管理服务实例。
+        #
+        # 刻意不用「新增一个公开的 /api/health」来解决：那会让白名单从 2 条
+        # 变成 3 条，等于为了兼容去扩大未认证面。这里只是把一个**本来就要返回
+        # 给未认证调用方的响应**说清楚自己是谁，公开面一条不增。
+        headers={
+            "WWW-Authenticate": 'Bearer realm="bionic-admin"',
+            "X-Bionic-Service": SERVICE_ID,
+        },
+    )
+
 
 # 允许本机页面跨端口访问。
 #
@@ -144,14 +320,8 @@ def _attach_governance(rows: list[dict]) -> list[dict]:
     if not ids:
         return rows
     from app.db import connect
-    placeholders = ",".join("?" * len(ids))
     with connect() as conn:
-        found = conn.execute(
-            f"SELECT id, access_count, last_accessed_at, memory_status, protected, "
-            f"importance_score, confidence_score, freshness_score "
-            f"FROM memories WHERE id IN ({placeholders})",
-            ids,
-        ).fetchall()
+        found = panelq.governance_columns(conn, ids)
     extra = {r["id"]: dict(r) for r in found}
     for r in rows:
         e = extra.get(r.get("id"))
@@ -336,13 +506,10 @@ def api_memories_timeline(axis: str = Query("created", pattern="^(created|update
     前者回答「什么时候记的」，后者回答「最近在用的有哪些」。
     """
     from app.db import connect
-    col = "created_at" if axis == "created" else "updated_at"
-    statuses = "('active','archived')" if include_archived else "('active')"
     with connect() as conn:
-        rows = conn.execute(
-            f"SELECT {col} AS ts, category FROM memories "
-            f"WHERE status IN {statuses} AND memory_status != 'pending_review'"
-        ).fetchall()
+        rows = panelq.timeline_rows(
+            conn, axis=axis, include_archived=bool(include_archived)
+        )
     now = datetime.now()
     buckets = [
         ("today", "今天", 0, 1),
@@ -422,13 +589,8 @@ def api_memories_breakdown(include_archived: bool = Query(False)):
     分三次查会读到三个不同瞬间的库，数字对不上时排查成本很高。
     """
     from app.db import connect
-    statuses = "('active','archived')" if include_archived else "('active')"
     with connect() as conn:
-        rows = conn.execute(
-            f"SELECT id, category, access_count, last_accessed_at, created_at, "
-            f"updated_at, importance_score FROM memories "
-            f"WHERE status IN {statuses} AND memory_status != 'pending_review'"
-        ).fetchall()
+        rows = panelq.breakdown_rows(conn, include_archived=bool(include_archived))
 
     total = len(rows)
 
@@ -712,10 +874,8 @@ def api_score(category: str = Query(""), limit: int = Query(50, ge=1, le=200)):
     ids = [r.get("memory_id") for r in rows if isinstance(r, dict) and r.get("memory_id")]
     if ids:
         from app.db import connect
-        placeholders = ",".join("?" * len(ids))
         with connect() as conn:
-            cats = {row[0]: (row[1] or "") for row in conn.execute(
-                f"SELECT id, category FROM memories WHERE id IN ({placeholders})", ids)}
+            cats = panelq.category_of(conn, ids)
         for r in rows:
             if isinstance(r, dict) and not r.get("category"):
                 r["category"] = cats.get(r.get("memory_id"), "")
@@ -1155,15 +1315,12 @@ def api_backup_restore_detail(restore_id: str):
 def api_protection_summary(category: str = Query(""),
                            include_archived: bool = Query(False)):
     from app.db import connect
-    sql = "SELECT * FROM memories WHERE 1=1"
-    args: list = []
-    if category.strip():
-        sql += " AND category=?"
-        args.append(category.strip())
-    if not include_archived:
-        sql += " AND status='active'"
     with connect() as conn:
-        rows = [db_rowdict(r) for r in conn.execute(sql, args).fetchall()]
+        rows = [db_rowdict(r) for r in panelq.protection_rows(
+            conn,
+            category=category.strip(),
+            include_archived=bool(include_archived),
+        )]
     return _ok(protect.summarize(rows))
 
 
@@ -1171,7 +1328,7 @@ def api_protection_summary(category: str = Query(""),
 def api_protection_one(memory_id: int):
     from app.db import connect
     with connect() as conn:
-        row = conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+        row = panelq.memory_row(conn, memory_id)
     if row is None:
         return _err(f"记忆 #{memory_id} 不存在", status=404)
     return _ok(protect.assess(db_rowdict(row)))
@@ -1319,15 +1476,12 @@ def api_value_conflicts(limit: int = Query(50, ge=1, le=200)):
 def api_stats():
     from app.db import connect
     with connect() as conn:
-        total = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-        active = conn.execute("SELECT COUNT(*) FROM memories WHERE status='active'").fetchone()[0]
-        archived = conn.execute("SELECT COUNT(*) FROM memories WHERE status='archived'").fetchone()[0]
-        tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-        links = conn.execute("SELECT COUNT(*) FROM memory_links").fetchone()[0]
-        events = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    return _ok({"memories_total": total, "memories_active": active,
-                "memories_archived": archived, "tasks": tasks,
-                "links": links, "events": events, "boot": BOOT_ID})
+        counts = panelq.stats(conn)
+    return _ok({"memories_total": counts["memories_total"],
+                "memories_active": counts["memories_active"],
+                "memories_archived": counts["memories_archived"],
+                "tasks": counts["tasks"], "links": counts["links"],
+                "events": counts["events"], "boot": BOOT_ID})
 
 
 @app.get("/api/ping")
@@ -1383,13 +1537,23 @@ def static_file(name: str):
     # 只允许白名单后缀，避免把目录里别的东西读出去（/static/../admin_ui.py）
     if "/" in name or "\\" in name or ".." in name:
         return _err("非法文件名", status=400)
-    if not name.endswith((".js", ".css", ".svg")):
+    # 图片后缀（.jpg/.png）是星图的深空底图与星尘层用的。它们是静态装饰素材，
+    # 不含任何数据，公开无风险 —— 和 3d-force-graph.min.js 同一性质。
+    if not name.endswith((".js", ".css", ".svg", ".jpg", ".png")):
         return _err("不支持的文件类型", status=400)
     target = STATIC_DIR / name
     if not target.is_file():
         return _err(f"找不到 {name}", status=404)
-    media = "text/javascript" if name.endswith(".js") else (
-        "text/css" if name.endswith(".css") else "image/svg+xml")
+    if name.endswith(".js"):
+        media = "text/javascript"
+    elif name.endswith(".css"):
+        media = "text/css"
+    elif name.endswith(".svg"):
+        media = "image/svg+xml"
+    elif name.endswith(".png"):
+        media = "image/png"
+    else:
+        media = "image/jpeg"
     return FileResponse(target, media_type=media)
 
 
@@ -1426,7 +1590,8 @@ def is_local_bind_host(host: str) -> bool:
     return addr.is_loopback
 
 
-def check_bind_safety(host: str, allow_remote: bool) -> tuple[bool, str]:
+def check_bind_safety(host: str, allow_remote: bool,
+                      has_token: bool = False) -> tuple[bool, str]:
     """启动前的绑定安全检查。返回 (是否允许启动, 面向用户的提示文本)。
 
     纯函数、不碰数据库、不读文件——所以测试可以直接调用它，
@@ -1435,6 +1600,11 @@ def check_bind_safety(host: str, allow_remote: bool) -> tuple[bool, str]:
     规则只有一条：**非本机地址必须显式授权**。
     `allow_remote=True` 时放行，但提示文本会变成安全警告；
     它不是认证机制，只是「用户自己承认知道风险」的一个签名位。
+
+    `has_token` 只影响**文案**，不影响任何判定：开了令牌认证之后，警告里就不该
+    再说"没有任何身份认证"（那是假话），但也不能因此就允许不带 --allow-remote
+    的远程绑定 —— 令牌与绑定授权互相独立，这一点不能因为多了个参数而松动。
+    默认 False 保持历史文案逐字不变，因此旧调用与旧测试无需改动。
     """
     if is_local_bind_host(host):
         if allow_remote:
@@ -1446,6 +1616,18 @@ def check_bind_safety(host: str, allow_remote: bool) -> tuple[bool, str]:
         return True, ""
 
     if allow_remote:
+        if has_token:
+            # 有令牌时不能再说"没有身份认证"，但也不能让这句话读起来像"已经安全了"：
+            # 令牌在明文 HTTP 上传输，同网段抓包就能拿走。
+            return True, (
+                f"[bionic-agent-admin] ⚠ 安全警告：管理面板正在绑定 {host}，已暴露到远程网络。\n"
+                f"[bionic-agent-admin] ⚠ 已启用令牌认证（除首页与 /static/* 外均需 Bearer 令牌）。\n"
+                f"[bionic-agent-admin] ⚠ 但令牌走的是明文 HTTP，同网段抓包即可截获；\n"
+                f"[bionic-agent-admin] ⚠ 远程场景请务必置于 HTTPS 反代之后，或只用 SSH 隧道转发。\n"
+                f"[bionic-agent-admin] ⚠ 能访问这个地址的人仍可恢复整库快照、导出备份包。\n"
+                f"[bionic-agent-admin] ⚠ --allow-remote 只是你的授权声明，不是认证；\n"
+                f"[bionic-agent-admin] ⚠ 令牌也不能替代它，两者互相独立。"
+            )
         return True, (
             f"[bionic-agent-admin] ⚠ 安全警告：管理面板正在绑定 {host}，已暴露到远程网络。\n"
             f"[bionic-agent-admin] ⚠ 当前管理面板【没有任何身份认证】。\n"
@@ -1454,6 +1636,19 @@ def check_bind_safety(host: str, allow_remote: bool) -> tuple[bool, str]:
             f"[bionic-agent-admin] ⚠ 请确认你处在可信网络（例如自己的隔离内网），\n"
             f"[bionic-agent-admin] ⚠ 并且不要把这个端口暴露到公网。\n"
             f"[bionic-agent-admin] ⚠ --allow-remote 只是你的授权声明，不是认证。"
+        )
+
+    if has_token:
+        # 有令牌也必须先授权绑定：令牌是"谁能用"，绑定授权是"能不能从外面用"，
+        # 两件事。这里绝不放宽，否则 --allow-remote 的保护就被令牌架空了。
+        return False, (
+            f"[bionic-agent-admin] 拒绝启动：--host {host} 不是本机地址。\n"
+            f"[bionic-agent-admin] 面板已启用令牌认证，但绑定授权与令牌互相独立、\n"
+            f"[bionic-agent-admin] 不能互相替代：远程绑定仍然需要你显式声明。\n"
+            f"[bionic-agent-admin] \n"
+            f"[bionic-agent-admin] 如果你只是想换个端口：--port 9000（host 保持默认 127.0.0.1）。\n"
+            f"[bionic-agent-admin] 如果你确实要暴露到局域网，请显式加 --allow-remote：\n"
+            f"[bionic-agent-admin]     python -m app.admin_ui --host {host} --allow-remote --token <令牌>"
         )
 
     return False, (
@@ -1474,19 +1669,57 @@ def _run_cli():
     parser.add_argument(
         "--allow-remote",
         action="store_true",
-        help="允许绑定非本机地址（面板无身份认证，暴露到局域网前请确认风险）",
+        help="允许绑定非本机地址（面板默认无身份认证，暴露到局域网前请确认风险）",
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help=("管理接口的访问令牌，也可用环境变量 BIONIC_ADMIN_TOKEN。"
+              "配置后除首页与 /static/* 之外全部要求 Authorization: Bearer <令牌>；"
+              "不传则认证关闭，行为与历史版本完全一致。"),
     )
     args = parser.parse_args()
+
+    # 解析出的令牌（可能是 --token，也可能来自环境变量）先验一遍再说别的：
+    # 非法令牌绝不能静默降级成"认证关闭"，也不能等到跑起来才发现全 401。
+    # 注意顺序 —— 这一步必须在任何数据库动作之前。
+    token = args.token if args.token is not None else os.environ.get(ADMIN_TOKEN_ENV, "")
+    token = str(token).strip()
+
+    # 显式传了空令牌 ≠ 想关闭认证，而是配错了。静默当成"关闭"会让人以为自己
+    # 开了认证、实际没开 —— 这种"看起来安全了"的错必须当场拒掉。
+    if args.token is not None and not token:
+        print("[bionic-agent-admin] 拒绝启动：--token 传了空值。\n"
+              "[bionic-agent-admin] 要关闭认证请直接不传 --token（或清空环境变量 "
+              f"{ADMIN_TOKEN_ENV}），不要传空串。", file=sys.stderr)
+        sys.exit(2)
+
+    problem = token_problem(token)
+    if problem:
+        print(f"[bionic-agent-admin] 拒绝启动：{problem}", file=sys.stderr)
+        sys.exit(2)
+
+    configure_auth(token)
 
     # 这一步必须发生在任何数据库动作之前：_lifespan 里的 _ensure_db() 会建库/迁移，
     # 所以在 uvicorn.run 之前就把"不该起来"的情况挡掉，被拒绝时进程里没有过任何
     # 数据库初始化，也就不会有任何生产数据被触碰。
-    allowed, message = check_bind_safety(args.host, args.allow_remote)
+    allowed, message = check_bind_safety(args.host, args.allow_remote,
+                                         has_token=bool(token))
     if not allowed:
         print(message, file=sys.stderr)
         sys.exit(2)
     if message:
         print(message, file=sys.stderr)
+
+    if token:
+        print(f"[bionic-agent-admin] 已启用令牌认证（令牌长度 {len(token)}，不显示内容）。\n"
+              f"[bionic-agent-admin] 浏览器打开面板后在顶栏「访问令牌」框里填同一个令牌；\n"
+              f"[bionic-agent-admin] 它只存在这一页的内存里，不写 local/sessionStorage、\n"
+              f"[bionic-agent-admin] 不写进 URL 或磁盘，刷新页面需重填。", file=sys.stderr)
+    else:
+        print("[bionic-agent-admin] 未配置令牌：面板没有任何身份认证（历史行为）。",
+              file=sys.stderr)
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

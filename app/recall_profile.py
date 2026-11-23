@@ -14,6 +14,11 @@ what a recall system is for.
 """
 import re
 
+# The default weight table lives in a value-only module so this file never
+# imports memory_lifecycle (OPT-02-D; that back-edge used to be a lazy import
+# inside weights_for(), i.e. a real cycle papered over by deferral).
+from app.recall_weights import RECALL_WEIGHTS
+
 # Query-shape detection. These are deliberately cheap lexical checks rather
 # than a classifier: a wrong guess only re-orders results (never filters them),
 # so the cost of being wrong is low and the cost of an opaque classifier is high.
@@ -127,12 +132,10 @@ def weights_for(memory_type: str = "", query: str = "",
                 base: dict | None = None) -> dict:
     """Return {weights, profile, shape, reasons} for one query.
 
-    `base` is the caller's default table so this module never has to import
-    memory_lifecycle (which would be a circular import).
+    `base` lets the caller pass its own default table; otherwise the shared
+    table from `app.recall_weights` is used (no import back into the ranker).
     """
-    from app.memory_lifecycle import RECALL_WEIGHTS as DEFAULT_WEIGHTS
-
-    base_weights = dict(base or DEFAULT_WEIGHTS)
+    base_weights = dict(base or RECALL_WEIGHTS)
     mtype = (memory_type or "").strip().lower()
     shape = detect_shape(query)
     reasons = []

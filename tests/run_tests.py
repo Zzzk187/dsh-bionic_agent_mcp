@@ -75,11 +75,37 @@ def _env() -> dict:
     清成空串而不是 `pop` 掉：两者实测等价（都得到 `sys.flags.optimize == 0`），
     但空串留痕——`os.environ` 里看得见我们动过它，`pop` 之后就分不清「本来
     没有」还是「我们删了」。取值 `''` 与 `'0'` 都不会开优化，`'1'`/`'2'` 会。
+
+    OPT-04a：**还必须把指向生产库的 `BIONIC_DB_PATH` 清掉**。子进程的
+    `tests/_env_guard.py` 会自己建沙箱，但如果父进程把 `BIONIC_DB_PATH`
+    指到了 `data/agent.db`，闸门会按「尊重调用方显式设置」的规则放行，
+    于是子进程真的去开生产库——这正是要防的回退路径。指向**别的**库时保留
+    （那是调用方的明确意图，比如 CI 想固定用某个库）。`BIONIC_SNAPSHOT_DIR`
+    同理：跟着生产库走的快照目录也不该由测试继承。
+
+    空白值也要清掉：`app/db.py` 写的是
+    `os.environ.get("BIONIC_DB_PATH") or 默认生产库路径`——`"   "` 是真值，
+    于是 `DB_PATH` 会变成一个名叫三个空格的相对路径，既不是生产库也不是
+    沙箱，排查起来更难。既然它没有意义，就当成没设。
     """
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONOPTIMIZE"] = ""
+
+    production_db = (ROOT / "data" / "agent.db").resolve()
+    raw = (env.get("BIONIC_DB_PATH") or "").strip()
+    drop = False
+    if not raw:
+        drop = True
+    else:
+        try:
+            drop = Path(raw).resolve() == production_db
+        except OSError:
+            drop = True
+    if drop:
+        env.pop("BIONIC_DB_PATH", None)
+        env.pop("BIONIC_SNAPSHOT_DIR", None)
     return env
 
 

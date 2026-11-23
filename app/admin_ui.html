@@ -127,12 +127,27 @@
     font-size: 11px; color: var(--muted);
   }
   .tl-swatch { width: 14px; height: 14px; border-radius: 2px; display: inline-block; }
+
+  /* 星尘远景层的极慢横移。位移只有几个百分点，但要 96 秒才走完一轮——
+     目的是让静止场景"有一点呼吸"，不是让人看见它在动。
+     translate3d 让它走合成层，不触发重排。 */
+  @keyframes starDrift {
+    0%   { transform: translate3d(-1.6%, 0.8%, 0) scale(1.04); }
+    50%  { transform: translate3d(1.6%, -0.8%, 0) scale(1.08); }
+    100% { transform: translate3d(-1.6%, 0.8%, 0) scale(1.04); }
+  }
 </style>
 </head>
 <body>
 <header>
   <h1>🧠 Bionic Agent 管理面板</h1>
   <div class="stats" id="stats"></div>
+  <input id="tokenInput" type="password" placeholder="访问令牌（可选）" autocomplete="off"
+    title="服务端用 --token 或 BIONIC_ADMIN_TOKEN 开启认证后，在这里填同一个令牌。只存在本页内存里，不写 localStorage/sessionStorage；刷新或关掉页面需重填。"
+    style="display:none;padding:4px 8px;font-size:12px;border-radius:6px;
+           background:var(--panel2);color:var(--txt);border:1px solid var(--line);width:150px">
+  <button id="tokenBtn" type="button" style="display:none;padding:4px 8px;font-size:12px;
+    border-radius:6px;background:var(--btn-bg);color:var(--btn-fg);border:none;cursor:pointer">填令牌</button>
   <select id="themeSel" title="配色：选「跟随 DSH」时自动同步软件的明暗与品牌色"
     style="padding:4px 8px;font-size:12px;border-radius:6px">
     <option value="dsh">跟随 DSH</option>
@@ -199,21 +214,32 @@
   </div>
   <div id="starCanvasWrap" style="position:relative;border:1px solid var(--line);border-radius:10px;
     overflow:hidden;background:var(--bg);height:calc(100vh - 230px);min-height:420px">
-    <!-- 深空底层：两张叠起来的径向渐变当星云，WebGL 画布透明所以能看见它。
-         刻意不用图片 —— 面板要能离线拷贝运行，几百字节的 CSS 比几百 KB 的图省事。 -->
+    <!-- 深空底层：真实星云照片（NASA JPL 公有领域，PIA12348 银河全景）当底图，
+         WebGL 画布透明所以能看见它。上面再压两层渐变：
+           - 中心偏暗、四周更暗的 vignette，把注意力收到星团上（图本身很亮，
+             不压一压的话节点颜色会被背景抢光）；
+           - 一层偏蓝的冷色调，让暖色节点（教训橙）跳出来。
+         素材是 295KB 的 JPEG，离线拷走照样能跑；加载失败只是退回背景色，不报错。 -->
     <div id="starSky" aria-hidden="true" style="position:absolute;inset:0;z-index:0;pointer-events:none;
       background:
-        radial-gradient(ellipse 60% 45% at 22% 18%, rgba(46,92,180,.30) 0%, rgba(46,92,180,0) 62%),
-        radial-gradient(ellipse 55% 50% at 78% 76%, rgba(128,72,190,.26) 0%, rgba(128,72,190,0) 60%),
-        radial-gradient(ellipse 80% 70% at 50% 42%, rgba(20,44,86,.55) 0%, rgba(4,7,13,0) 72%),
+        radial-gradient(ellipse 62% 58% at 50% 46%, rgba(3,5,10,.18) 0%, rgba(3,5,10,.62) 72%, rgba(2,4,8,.88) 100%),
+        linear-gradient(160deg, rgba(8,16,38,.42) 0%, rgba(6,10,22,.20) 45%, rgba(10,6,24,.46) 100%),
+        url('static/nebula.jpg') center/cover no-repeat,
         #05070c"></div>
-    <!-- 星野：纯 CSS 点阵，radial-gradient 平铺 @ 多层不同尺寸造视差感 -->
-    <div id="starField" aria-hidden="true" style="position:absolute;inset:0;z-index:0;pointer-events:none;opacity:.75;
+    <!-- 星尘：远景层，比底图更散、更淡，缓慢横移造视差（CSS 动画，不占 JS 帧）。
+         它压在星云上、点阵下，作用是填掉「照片缩放到满屏后中间那块平坦区」。 -->
+    <div id="starDust" aria-hidden="true" style="position:absolute;inset:-10% -20%;z-index:0;pointer-events:none;
+      opacity:.5;mix-blend-mode:screen;
+      background:url('static/star-dust.jpg') center/cover no-repeat;
+      animation:starDrift 96s linear infinite"></div>
+    <!-- 星野：纯 CSS 点阵，radial-gradient 平铺 @ 多层不同尺寸造视差感。
+         底图已经是真星场，这里只留最细的一层，起「颗粒」作用而不是当星星。 -->
+    <div id="starField" aria-hidden="true" style="position:absolute;inset:0;z-index:0;pointer-events:none;opacity:.5;
       background-image:
-        radial-gradient(1px 1px at 12px 34px, rgba(255,255,255,.85) 0%, rgba(255,255,255,0) 100%),
-        radial-gradient(1px 1px at 78px 112px, rgba(180,210,255,.65) 0%, rgba(180,210,255,0) 100%),
-        radial-gradient(1.5px 1.5px at 140px 62px, rgba(255,255,255,.9) 0%, rgba(255,255,255,0) 100%),
-        radial-gradient(1px 1px at 190px 158px, rgba(150,190,255,.55) 0%, rgba(150,190,255,0) 100%);
+        radial-gradient(1px 1px at 12px 34px, rgba(255,255,255,.8) 0%, rgba(255,255,255,0) 100%),
+        radial-gradient(1px 1px at 78px 112px, rgba(180,210,255,.6) 0%, rgba(180,210,255,0) 100%),
+        radial-gradient(1.5px 1.5px at 140px 62px, rgba(255,255,255,.85) 0%, rgba(255,255,255,0) 100%),
+        radial-gradient(1px 1px at 190px 158px, rgba(150,190,255,.5) 0%, rgba(150,190,255,0) 100%);
       background-size:220px 220px, 260px 260px, 300px 300px, 340px 340px"></div>
     <!-- 3D 库的专属挂载点：重建星图时只清这里，
          绝不碰外面的深空层和提示卡（曾经写成 host.innerHTML='' 把它们一起删了） -->
@@ -625,12 +651,95 @@ applyTheme();
 // 为什么要它：宿主半的 panel-boot.log 只能证明 Node 侧加载了插件；iframe 到底
 // 有没有真的渲染出来、脚本有没有真的求值，只有页面自己知道。重启后若出问题，
 // data/panel-client.log 有记录 = 浏览器端没问题、该查别处；没有 = 卡在加载前。
-fetch(withBase('/api/ping'), {method:'GET'}).catch(()=>{});
-
+// 服务端开了认证时这个请求会 401，报到就记不上——此时换个标记得知"页面到了、
+// 只是没令牌"，所以带上令牌再试一次（见下面 sendPing）。
 const $ = (s,el=document)=>el.querySelector(s);
 const $$ = (s,el=document)=>[...el.querySelectorAll(s)];
+
+// ---------- 访问令牌 ----------
+//
+// 服务端（app/admin_ui.py）可以用 --token 或 BIONIC_ADMIN_TOKEN 开启认证。
+// 开了之后除首页与 /static/* 之外全部要 Authorization: Bearer <令牌>，本页面
+// 的每个 API 调用都得带上。令牌从哪来：浏览器里打不开命令行，所以由使用者
+// 在顶栏手填一次。
+//
+// **刻意不写 localStorage / sessionStorage，只留在这个页面的内存变量里。**
+// 原因是安全边界：一旦落到 storage，同源下任何脚本（含将来引入的三方脚本、
+// 或被注入的片段）都能把它读走，那就不叫"只给这个人用"了。代价是刷新/重开
+// 页面要重填一次——这个代价值得付，而且只影响开了认证的人（默认关闭时压根
+// 不会看到这个输入框）。
+let _memToken = '';
+function setToken(v){ _memToken = v || ''; }
+function authHeaders(extra){
+  const h = Object.assign({}, extra || {});
+  if(_memToken){ h['Authorization'] = 'Bearer ' + _memToken; }
+  return h;
+}
+
+// 认证失败时把令牌输入框亮出来。不做自动重试——同一个错牌重试只会把服务端
+// 日志刷满；让人看见"该输令牌了"比悄悄失败有用。
+let _authPrompted = false;
+function showTokenUi(hint){
+  const inp = $('#tokenInput'), btn = $('#tokenBtn');
+  if(!inp || !btn) return;
+  inp.style.display = ''; btn.style.display = '';
+  if(!_authPrompted){
+    _authPrompted = true;
+    if(hint){ toast(hint, 'err'); }
+  }
+}
+function hideTokenUi(){
+  const inp = $('#tokenInput'), btn = $('#tokenBtn');
+  if(inp){ inp.style.display = 'none'; }
+  if(btn){ btn.style.display = 'none'; }
+  _authPrompted = false;
+}
+
+// 令牌只活在内存里，所以这里**不能 reload** —— reload 会把 _memToken 清空，
+// 等于刚填进去就扔掉，页面永远停在"需要访问令牌"。改成原地重拉数据。
+async function applyTokenFromInput(){
+  const inp = $('#tokenInput');
+  if(!inp) return;
+  const v = (inp.value || '').trim();
+  setToken(v);
+  if(!v){
+    toast('已清空令牌，页面将回到未认证状态', 'ok');
+    await refreshAll();
+    return;
+  }
+  hideTokenUi();
+  await refreshAll();
+  // refreshAll 里任何一次 401 都会把令牌框重新亮出来（_authPrompted 已在
+  // hideTokenUi 里复位），所以这里只需在成功时给一句确认。
+  const j = await api('/api/stats');
+  if(j.ok){
+    toast('令牌有效，已解锁（仅本页有效，刷新后需重填）', 'ok');
+  }
+}
+
+// 重新拉一遍页面依赖的数据。顺序与启动 IIFE 保持一致，避免某些面板没被喂到。
+async function refreshAll(){
+  await sendPing();
+  await loadStats();
+  await loadCategories();
+  await loadMemories();
+  await loadTimeline();
+}
+document.addEventListener('DOMContentLoaded', ()=>{
+  const btn = $('#tokenBtn');
+  if(btn){ btn.onclick = applyTokenFromInput; }
+  const inp = $('#tokenInput');
+  if(inp){ inp.onkeydown = e => { if(e.key === 'Enter'){ applyTokenFromInput(); } }; }
+});
+
 const api = async (url, opts={}) => {
-  const r = await fetch(withBase(url), Object.assign({headers:{'Content-Type':'application/json'}}, opts));
+  const o = Object.assign({}, opts);
+  o.headers = authHeaders(Object.assign({'Content-Type':'application/json'}, opts.headers || {}));
+  const r = await fetch(withBase(url), o);
+  // 401 不是"请求写错了"，是"没给令牌/令牌不对"。此时响应体是
+  // {"ok":false,"message":"需要访问令牌…"}，下面统一按 ok:false 返回，让调用方
+  // 走各自的失败分支，同时把令牌框亮出来。
+  if(r.status === 401){ showTokenUi('这个面板需要访问令牌'); }
   const j = await r.json().catch(()=>({ok:false,message:'响应解析失败'}));
   return j;
 };
@@ -723,6 +832,9 @@ async function loadStarMap(){
   $('#starLegend').textContent =
     `${m.node_count||0} 个记忆 · ${m.edge_count||0} 条连线 · ${m.cluster_count||0} 个天区`;
   renderStarLegend();
+  /* 表面纹理要在建节点之前到 —— 节点对象只在建图时造一次，
+   * 后到的纹理没法给已经造好的球补顶点色（只能整图重建，没必要）。*/
+  await loadStarSurface();
   buildStarGraph();
   return true;
 }
@@ -806,19 +918,141 @@ function threeOf(G, strict){
   } catch { return null; }
 }
 
+/* 星光球的表面纹理。
+ *
+ * 为什么不用贴图：库把 three.js 打进去了，页面没有全局 THREE，拿不到
+ * Texture / SpriteMaterial / CanvasTexture 构造器（场景里 traversal 实测
+ * sprites=0、texs=0，连一个能反推的样本都没有）。所以 material.map 这条路
+ * 直接堵死。
+ *
+ * 但 MeshBasicMaterial 支持 vertexColors，且 BufferAttribute 构造器能从
+ * 任何几何的 attributes 上拿到 —— 于是把纹理「像素级采样」进顶点色，
+ * 效果等价于贴图：同一个球上每个顶点带自己的颜色，WebGL 逐顶点插值后
+ * 就是有颗粒的表面。
+ *
+ * 素材是真实的太阳表面（SDO 观测的日面粉粒图），烘成灰度图后：
+ *   亮度 → 顶点色的乘数（暗处是"坑"，亮处是"亮斑"）
+ *   亮度 → 半径的起伏（轮廓不再是完美球，像一团翻腾的等离子）
+ * 一份灰度图同时驱动颜色和几何，两者天然对齐。*/
+const SURFACE = { ready: false, w: 0, h: 0, lum: null };
+async function loadStarSurface(){
+  if (SURFACE.ready || SURFACE.failed) return SURFACE.ready;
+  try {
+    const img = new Image();
+    const loaded = new Promise((res, rej) => { img.onload = res; img.onerror = rej; });
+    img.src = withBase('/static/star-surface.png');
+    /* 顺序不能反：先设 src 再 await。反过来的写法（先 await 一个 promise
+     * 再赋 src）会让 promise 永远挂着 —— onload 永远不会来，页面无限等待，
+     * 表现是 tab 点了没反应、控制台也无报错（踩过）。*/
+    await loaded;
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth; c.height = img.naturalHeight;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0);
+    const d = ctx.getImageData(0, 0, c.width, c.height).data;
+    const lum = new Float32Array(c.width * c.height);
+    for (let i = 0, j = 0; i < d.length; i += 4, j++) lum[j] = d[i] / 255;
+    SURFACE.w = c.width; SURFACE.h = c.height; SURFACE.lum = lum; SURFACE.ready = true;
+  } catch (e) {
+    SURFACE.failed = true;
+    console.warn('[starmap] 表面纹理没加载起来，节点退回纯色', e);
+  }
+  return SURFACE.ready;
+}
+/* 双线性太慢，最近邻够用：这是颗粒纹理，插值反而糊掉细节 */
+function surfaceLum(u, v){
+  if (!SURFACE.ready) return 0.5;
+  const x = ((u % 1) + 1) % 1;
+  const y = v < 0 ? 0 : (v > 0.9999 ? 0.9999 : v);
+  const ix = Math.min(SURFACE.w - 1, (x * SURFACE.w) | 0);
+  const iy = Math.min(SURFACE.h - 1, (y * SURFACE.h) | 0);
+  return SURFACE.lum[iy * SURFACE.w + ix];
+}
+/* 造一颗"有表面"的星：球 → 按纹理起伏半径 → 按纹理上色。
+ * 几何按「类别 + 种子」缓存，57 个节点只造 6 份，重建时复用。*/
+const STAR_BALL_CACHE = new Map();
+function makeStarBall(T, clr, seed){
+  const key = clr + '|' + seed;
+  const hit = STAR_BALL_CACHE.get(key);
+  if (hit) return hit;
+  const geo = new T.Geo(1, 48, 32);
+  const pos = geo.attributes.position;
+  const Attr = pos.constructor;
+  const n = pos.count;
+  const col = new Float32Array(n * 3);
+  const base = new T.Color(clr);
+  /* 假光源：从左上前方打过来。MeshBasicMaterial 吃不到场景里的
+   * AmbientLight/DirectionalLight（那些只对 Lambert/Phong 生效），所以
+   * 球的立体感只能自己烘进顶点色。不加这一步，球就是一块平的彩色圆盘
+   * ——这正是「丑」的根源，跟有没有纹理无关。*/
+  const LX = -0.42, LY = 0.74, LZ = 0.52;
+  for (let i = 0; i < n; i++) {
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    const r0 = Math.hypot(x, y, z) || 1;
+    const nx = x / r0, ny = y / r0, nz = z / r0;
+    const u = Math.atan2(z, x) / (Math.PI * 2) + 0.5;
+    const v = Math.acos(Math.max(-1, Math.min(1, y / r0))) / Math.PI;
+    /* 纹理缩放是这轮的关键参数。
+     * 球在屏幕上只有 5~7px 半径：如果按 u*2 采样，一圈球面上塞进去 1024 个
+     * 像素的颗粒，每个颗粒只分到不到 0.1 像素 —— 采样出来就是白噪声，肉眼看
+     * 不到"表面"，只看到一颗干净球。
+     * 改成 u*0.45：一圈只取纹理的 45%，颗粒被放大成「几块明显的明暗斑」，
+     * 这个尺寸上才真的看得见表面。这是分辨率决定的事，不是调参口味问题。*/
+    const l = surfaceLum(u * 0.45 + seed, v);
+    /* 起伏要非常轻。放大到屏幕 8~10px 半径以后，0.11 的起伏就足以把球
+     * 揉成一串多边形疙瘩（实测「授权」那团看着像一坨土豆）。真实恒星是
+     * 近乎完美的球，颗粒是**明暗**上的事，不是形状上的事 —— 所以这里只留
+     * 0.03 当作轮廓上极细的毛刺。*/
+    const bump = 0.985 + 0.03 * l;
+    pos.setXYZ(i, x * bump, y * bump, z * bump);
+    /* 朗伯项：正面朝光处亮，背面暗。0.10 的环境光托底（原来 0.30 太亮，
+     * 明暗拉不开，球看着还是平的）；lam 取 0.55 次方让过渡集中在亮部、
+     * 暗面更大片 —— 恒星该是「一小块高光 + 大面积暗」而不是均匀渐变。*/
+    const lam = Math.max(0, nx * LX + ny * LY + nz * LZ);
+    const lit = 0.10 + 1.02 * Math.pow(lam, 0.55);
+    /* 纹理当明暗斑：亮处是耀斑、暗处是黑子。
+     * 幅度拉大到 0.62 —— 球只有 5~7px 半径，斑驳弱了完全看不出来；
+     * 但同时把均值往 1 上抬（0.70 基线），免得整颗球发灰。*/
+    const tex = 0.70 + 0.62 * l;
+    const k = lit * tex;
+    /* 迎光面「白热」：真实恒星的高光会过曝成白色，不是纯类别色。
+     * 按 lam 的四次方把最亮那一小块往白里推 —— 这一步是让球「像星」
+     * 的关键，只调明暗不出白，读起来还是彩色橡皮球。*/
+    const hot = Math.pow(lam, 4) * 0.85;
+    col[i * 3]     = Math.min(1, base.r * k + hot);
+    col[i * 3 + 1] = Math.min(1, base.g * k + hot);
+    col[i * 3 + 2] = Math.min(1, base.b * k + hot);
+  }
+  geo.setAttribute('color', new Attr(col, 3));
+  geo.computeVertexNormals();
+  STAR_BALL_CACHE.set(key, geo);
+  return geo;
+}
+
 /* 深空底层的开关：深色主题下露出来，浅色主题下淡出——
- * 浅色背景里塞一片星云会脏得像屏幕没擦干净。*/
+ * 浅色背景里塞一片星云会脏得像屏幕没擦干净。
+ * 星尘层同理，而且它带 mix-blend-mode:screen，浅色底上会把字全部提亮，
+ * 所以淡出要更彻底（直接 0）。*/
 function applyStarSky(dark){
   const sky = document.getElementById('starSky');
   const field = document.getElementById('starField');
+  const dust = document.getElementById('starDust');
   if (sky) sky.style.opacity = dark ? '1' : '0';
-  if (field) field.style.opacity = dark ? '0.75' : '0';
+  if (field) field.style.opacity = dark ? '0.5' : '0';
+  if (dust) dust.style.opacity = dark ? '0.5' : '0';
 }
 
-/* 网格球壳 + 扫掠环。
- * 球壳套在星团外面（半径取星团最大半径的 1.15 倍），像飞行器的座舱玻璃；
- * 环是「赤道扫描线」，视觉上给静态场景一点机械感。
- * 实测加壳后着色像素 +31061，且因为用了 wireframe + 低不透明度，不挡节点。*/
+/* 天球经纬网。
+ *
+ * 历史（别再踩）：
+ *   1. 第一版是「球壳 + 一圈压扁的实心赤道盘」。压扁的球是**填充面**不是圆环
+ *      （浏览器里没有全局 THREE，拿不到 Torus 构造器），暗底时不起眼，一换
+ *      星云底图就变成一块巨大的半透明椭圆疤。
+ *   2. 第二版想把环换成「压扁的线框球」—— 更糟：球几何的 wireframe 画的是
+ *      **经线**（从两极辐射），压扁之后满屏放射状线束，比疤还吵。
+ *
+ * 结论：这种照片底图不需要几何线框来撑场面，线框只会和真实星云打架。
+ * 所以现在只留一层极淡的经纬球壳，纯粹当「空间参考」，不描边、不加环。*/
 function addStarGrid(G, pal){
   const T = threeOf(G);
   if (!T) return null;
@@ -826,29 +1060,24 @@ function addStarGrid(G, pal){
     const nodes = G.graphData().nodes;
     let R = 0;
     nodes.forEach(n => { R = Math.max(R, Math.hypot(n.x || 0, n.y || 0, n.z || 0)); });
-    R = Math.max(200, R) * 1.15;
+    R = Math.max(200, R) * 1.18;
 
     const grp = new T.Group();
 
     const shellMat = new T.Mat();
     shellMat.wireframe = true;
     shellMat.transparent = true;
-    shellMat.opacity = pal.dark ? 0.075 : 0.05;
+    // 压到几乎只剩暗示：深色主题下 0.030，只比黑高一点点。
+    // 它存在的唯一意义是让相机旋转时有「我在球里」的感觉。
+    //
+    // 浅色主题干脆不画（0）：白底上这圈网格读起来像蜘蛛网，比没有更吵。
+    // 试过 0.022 和 0.010 两档，都还是明显——问题不在透明度而在「深色线画在
+    // 白底上」这个组合本身，所以直接归零，浅色主题只留星团。
+    shellMat.opacity = pal.dark ? 0.030 : 0.0;
     shellMat.depthWrite = false;
-    shellMat.color = new T.Color(pal.dark ? 0x4a7dd6 : 0x8fa8c8);
-    const shell = new T.Mesh(new T.Geo(R, 16, 12), shellMat);
+    shellMat.color = new T.Color(pal.dark ? 0x6f8fd0 : 0x8fa8c8);
+    const shell = new T.Mesh(new T.Geo(R, 20, 14), shellMat);
     grp.add(shell);
-
-    // 赤道环：一段细环，绕着 y 轴，比球壳亮一点
-    const ringMat = new T.Mat();
-    ringMat.transparent = true;
-    ringMat.opacity = pal.dark ? 0.16 : 0.10;
-    ringMat.depthWrite = false;
-    ringMat.side = 2;                       // THREE.DoubleSide
-    ringMat.color = new T.Color(pal.dark ? 0x66a3ff : 0x7f9ec4);
-    const ring = new T.Mesh(new T.Geo(R * 1.02, 64, 3), ringMat);
-    ring.scale.set(1, 0.008, 1);            // 压扁成光盘
-    grp.add(ring);
 
     G.scene().add(grp);
     STAR.grid = grp;
@@ -978,13 +1207,32 @@ function buildStarGraph(){
   const applyNodeStyle = () => {
     const T = threeOf(G, true);
     if (!T) return false;
+    let seedSeq = 0;
     G.nodeThreeObject(n => {
       const clr = STAR_COLORS[n.category] || '#94a3b8';
       const grp = new T.Group();
-      const sz = 2.6 + Math.log2(Math.max(20, n.size || 60) / 20) * 1.4;
+      /* 尺寸上限是布局给的，不是审美给的：实测同类别节点在屏幕上的最小间距
+       * 是 1.9~3.7px（教训 20 个、环境 19 个挤在一个天区里），而屏幕半径
+       * ≈ 0.296 × sz。球半径一超过间距的一半，同族节点就糊成一串疙瘩
+       * （「授权」那 4 个挨在一起时特别明显）。
+       * 所以这里取 sz 4~7（半径 1.2~2.1px）：不重叠，但也**放不下表面细节**
+       * —— 顶点色纹理在这个尺度上只能贡献整体色调的丰富度，看不出颗粒。
+       * 若要让球有可辨的表面，得改布局（拉大间距或减少同天区节点数），
+       * 那是另一件事，不在视觉微调的范围里。*/
+      const sz = 4.6 + Math.log2(Math.max(20, n.size || 60) / 20) * 0.85;
+      /* 核心球：带真实表面纹理（顶点色 + 半径起伏），不再是平的纯色球。
+       * 种子按类别分组给，同一类别的星长一个样，跨类别不同——整屏不会出现
+       * 57 颗一模一样的球，这是"素"的另一半来源（原来看起来像彩色气泡）。*/
+      const seedBase = { '教训': 0.00, '环境': 0.31, '项目': 0.62, '授权': 0.83, 'preference': 0.47, 'lesson': 0.18 }[n.category] ?? (seedSeq++ / 57);
       const coreMat = new T.Mat();
-      coreMat.color = new T.Color(clr);
-      const core = new T.Mesh(new T.Geo(1, 12, 10), coreMat);
+      coreMat.color = new T.Color('#ffffff');   // 颜色全交给顶点色，这里必须白
+      if (SURFACE.ready) {
+        coreMat.vertexColors = true;
+        coreMat.transparent = false;
+      } else {
+        coreMat.color = new T.Color(clr);
+      }
+      const core = new T.Mesh(SURFACE.ready ? makeStarBall(T, clr, seedBase) : new T.Geo(1, 12, 10), coreMat);
       core.scale.set(sz, sz, sz);
       const glowMat = new T.Mat();
       glowMat.color = new T.Color(clr);
@@ -993,11 +1241,35 @@ function buildStarGraph(){
       glowMat.blending = 2;        // THREE.AdditiveBlending
       glowMat.depthWrite = false;
       const glow = new T.Mesh(new T.Geo(1, 12, 10), glowMat);
-      const gs = sz * 2.8;
+      /* 光晕收窄：球本体放大以后，原来 2.8 倍的光团会把球整个盖住，
+       * 视觉上又退回「彩色气球」。1.75 倍刚好裹住球一层。*/
+      const gs = sz * 1.75;
       glow.scale.set(gs, gs, gs);
       grp.add(core);
       grp.add(glow);
-      grp.__data = n; core.__data = n; glow.__data = n;   // ← 见上，删了点选就废
+
+      /* 第三层：极淡的外晕。
+       *
+       * 曾试过给亮节点加「十字星芒」——用两道压扁的球当光带。实测不行：
+       * 压扁球是实体不是直线，球面分段少时压出来是棱角多边形；更要命的是
+       * 场景一直在转，星芒跟着转，看起来像一堆毛刺而不是光芒。
+       * 结论：三维场景里的「星芒」必须贴在屏幕上（Sprite），而拿不到 Sprite
+       * 构造器，所以这条路不通。改用层次更柔的外晕来制造亮度梯度。*/
+      const haloMat = new T.Mat();
+      haloMat.color = new T.Color(clr);
+      haloMat.transparent = true;
+      haloMat.opacity = 0.055;
+      haloMat.blending = 2;        // THREE.AdditiveBlending
+      haloMat.depthWrite = false;
+      const halo = new T.Mesh(new T.Geo(1, 10, 8), haloMat);
+      /* 外晕仍然要留得远（它负责天区的"云气"感），但透明度压到 0.035，
+       * 免得盖住球面的颗粒。*/
+      haloMat.opacity = 0.035;
+      const hs = sz * 3.6;
+      halo.scale.set(hs, hs, hs);
+      grp.add(halo);
+
+      grp.__data = n; core.__data = n; glow.__data = n; halo.__data = n;   // ← 见上，删了点选就废
       return grp;
     });
     G.graphData({ nodes, links });   // 重建节点对象
@@ -1102,6 +1374,21 @@ function paintStarLabels(G, nodes){
   const host = $('#starCanvasWrap');
   if (!host) return;
   host.querySelectorAll('.star-cat-label').forEach(e => e.remove());
+  /* 数组也要一起清：只删 DOM 不清数组的话，每重画一次 sync() 里就多一批
+   * 指向已脱离文档的元素的条目，切几次主题就白跑几十次 graph2ScreenCoords。
+   * （以前只在构建时调一次所以看不出来，加了主题切换后就成了真泄漏。）*/
+  STAR.labels = [];
+  const dark = (document.documentElement.dataset.theme || 'dark') !== 'light';
+  /* 浅色主题要把类别色压暗两档再上字。
+   * 原因有两层：①这些颜色是按深色底选的（亮黄 #ffc75c、亮青 #3ee0a8），
+   * 直接放白底上亮度太高；②更麻烦的是字压在**节点自己的辉光**上——「授权」
+   * 那两个字正落在黄色光晕里，光晕和白底差不多亮。
+   * 0.58 不够（实测仍是黄块），压到 0.42 才压得住。*/
+  const tone = (c) => dark ? c : shade(c, 0.42);
+  /* 浅色主题不能再用白色描边＋彩色外发光：白描边贴在白底衬上没有边界，
+   * 外发光反过来把字糊开（实测「授权」始终是一团黄块）。
+   * 改成实底衬 + 细的深色描边，完全不发光，可读性靠底衬而不是靠字本身。*/
+  const rim = dark ? 'rgba(0,0,0,.92)' : 'rgba(30,34,44,.55)';
   const groups = {};
   nodes.forEach(n => { (groups[n.category] = groups[n.category] || []).push(n); });
   Object.entries(groups).forEach(([cat, arr]) => {
@@ -1109,9 +1396,20 @@ function paintStarLabels(G, nodes){
     const el = document.createElement('div');
     el.className = 'star-cat-label';
     el.textContent = cat;
+    /* 描边 + 半透明底衬，两层叠起来才在任意背景上都读得清。
+     *
+     * 只加描边是不行的：「授权」的标签正好压在它自己的黄色辉光上，而辉光和
+     * 白底的亮度差不多，白描边等于没有边界，字就糊进光晕里了（实测改成压暗
+     * 字色也只改善一点）。加底衬把字和后面的光晕切开，问题才真正消失 ——
+     * 这是「可读性靠背景、不靠字本身」的典型情况。*/
+    const pill = dark ? 'rgba(8,10,16,.58)' : 'rgba(252,253,255,.90)';
+    const shadow = dark
+      ? `-1px -1px 0 ${rim}, 1px -1px 0 ${rim}, -1px 1px 0 ${rim}, 1px 1px 0 ${rim}, 0 0 10px ${withAlpha(starColor(cat), .6)}`
+      : `0 0 0 .6px ${rim}`;
     el.style.cssText = `position:absolute;transform:translate(-50%,-50%);pointer-events:none;
-      font-size:12px;font-weight:600;letter-spacing:.08em;color:${starColor(cat)};
-      text-shadow:0 0 8px ${withAlpha(starColor(cat), .85)}, 0 0 2px #000;opacity:.9;z-index:1`;
+      font-size:12px;font-weight:700;letter-spacing:.08em;color:${tone(starColor(cat))};
+      padding:1px 7px;border-radius:9px;background:${pill};
+      text-shadow:${shadow};opacity:.95;z-index:1`;
     host.appendChild(el);
     STAR.labels = STAR.labels || [];
     STAR.labels.push({ el, pos: c });
@@ -1132,6 +1430,18 @@ function paintStarLabels(G, nodes){
     requestAnimationFrame(sync);
   };
   if (!STAR.labelLoop) { STAR.labelLoop = true; requestAnimationFrame(sync); }
+}
+
+/** 把十六进制颜色按系数压暗（k<1 变暗，k>1 变亮），返回同格式的 #rrggbb */
+function shade(color, k){
+  const c = (color || '').trim().replace('#', '');
+  const full = c.length === 3 ? c[0] + c[0] + c[1] + c[1] + c[2] + c[2] : c;
+  if (!/^[0-9a-fA-F]{6}$/.test(full)) return color;
+  const clamp = (v) => Math.max(0, Math.min(255, Math.round(v)));
+  const r = clamp(parseInt(full.slice(0, 2), 16) * k);
+  const g = clamp(parseInt(full.slice(2, 4), 16) * k);
+  const b = clamp(parseInt(full.slice(4, 6), 16) * k);
+  return '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
 }
 
 function withAlpha(color, a){
@@ -1197,6 +1507,13 @@ function bindStarEvents(){
       // 必须保持透明：改成 pal.bg 会把底下的深空整片盖掉
       STAR.graph.backgroundColor('rgba(0,0,0,0)');
       applyStarSky(pal.dark);
+      // 标签的描边色是按主题算死的（深色配黑描边、浅色配白描边），
+      // 所以切主题必须重画一遍，否则「授权」那种亮黄会留在错误的描边上。
+      //
+      // 坐标必须取 graphData().nodes（力导向跑完的实时位置），不能取
+      // STAR.data.nodes（那是后端给的初始摆位）—— 用后者重画会让所有
+      // 标签瞬间跳回起始坐标，跟眼前星团对不上。
+      paintStarLabels(STAR.graph, STAR.graph.graphData().nodes);
       STAR.graph.linkColor(l => l.kind === 'semantic'
         ? withAlpha(starColor(catOfLink(l)), 0.30)
         : withAlpha(pal.muted, l.kind === 'tag' ? 0.10 : 0.38));
@@ -2275,12 +2592,18 @@ $('#bkConfirmCancel').onclick = ()=>{ $('#bkConfirmBg').classList.remove('show')
 $('#bkConfirmGo').onclick = doBkExecute;
 
 /* ---------- 启动 ---------- */
+// 报到：带令牌发一次（服务端没开认证时这个头就是多余的，无害）。
+// 401 说明"页面跑起来了但没令牌"，正好让顶栏的令牌框亮出来。
+async function sendPing(){
+  try {
+    const r = await fetch(withBase('/api/ping'), {method:'GET', headers: authHeaders()});
+    if(r.status === 401){ showTokenUi('这个面板需要访问令牌'); }
+  } catch(e){ /* 报到失败不影响页面功能，静默 */ }
+}
 (async ()=>{
   bindStarEvents();
-  await loadStats();
-  await loadCategories();
-  await loadMemories();
-  await loadTimeline();   // 概览条要全库口径，不能等用户点刷新
+  // 概览条要全库口径，不能等用户点刷新——所以这里连 timeline 一起拉。
+  await refreshAll();
 })();
 </script>
 </body>

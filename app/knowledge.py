@@ -517,58 +517,9 @@ def _embed_batch(conn, rows) -> int:
 # Search
 # ---------------------------------------------------------------------------
 
-# Synonym groups, ported from dsh-memory's `知识检索.ps1` ($Synonyms).
-# The table is not complete by design -- bigrams cover the gaps -- but it is
-# what makes "压缩" also match "compact" / "摘要" / "剪枝", which bigrams never
-# will. Keeping it in sync matters: a user asking the same question through MCP
-# and through PowerShell should get the same answer.
-_SYNONYM_GROUPS: tuple[tuple[str, ...], ...] = (
-    ("上下文坍缩", "上下文崩溃", "context collapse", "压缩崩坏", "上下文退化", "压缩吃掉"),
-    ("上下文", "context", "窗口"),
-    ("交接", "handoff", "交接单", "接力", "换会话"),
-    ("压缩", "compact", "summarize", "摘要", "剪枝"),
-    ("缓存", "cache", "命中率", "TTL", "前缀"),
-    ("记忆", "memory", "回忆", "遗忘", "沉淀"),
-    ("语音", "TTS", "唱歌", "声线", "克隆", "voice", "音频"),
-    ("微调", "LoRA", "fine-tune", "P-Tuning", "训练"),
-    ("评测", "基准", "benchmark", "rubric", "跑分", "评测集"),
-    ("安全", "注入", "攻击", "防御", "红线", "越权"),
-    ("切分", "分块", "chunk", "分段", "召回"),
-    ("部署", "推理", "vLLM", "SGLang", "服务化", "显存"),
-    ("知识图谱", "图谱", "GraphRAG", "Graph RAG", "本体"),
-    ("编排", "orchestration", "多Agent", "多智能体", "workflow", "handoff"),
-    ("提示词", "prompt", "系统提示", "指令"),
-    ("缓存前缀", "前缀", "prefix", "缓存"),
-    ("评测成本", "计费", "token 计费", "价格", "省钱", "缓存价"),
-    ("代码审查", "code review", "review skill", "审查"),
-    ("浏览器", "浏览器", "playwright", "agent-browser", "自动化"),
-    ("Obsidian", "双链", "知识库", "Claudian", "插件"),
-    ("私有化", "自建", "本地部署", "GLM", "显存门槛"),
-    ("框架", "LangGraph", "CrewAI", "LlamaIndex", "Agent SDK", "选型"),
-    ("缩放", "量化", "AutoRound", "W4A16", "显存"),
-    ("人格", "BFI", "性格", "漂移"),
-    ("技能包", "skill", "技能", "插件", "SKILL.md"),
-    ("长任务", "task list", "功能清单", "handoff", "上下文重置"),
-)
-
-
-def _segments(text: str) -> list[str]:
-    """Split text into CJK runs / latin tokens.
-
-    Kept because the synonym table is never complete: a query word may appear
-    glued to other characters inside a longer run, and a pure bigram scan cannot
-    tell "显存" (a unit) from "存不" (a seam).
-    """
-    out: list[str] = []
-    for part in re.split(r"[\s，。、；：？！（）()\[\]【】<>/\\|·\-—\"'“”‘’]+", text.lower()):
-        if not part:
-            continue
-        if re.fullmatch(r"[a-z0-9_.]+", part):
-            if len(part) >= 2:
-                out.append(part)
-        else:
-            out.append(part)
-    return out
+# 同义词表与分词函数已抽到 `app.text_tokens`（记忆侧也要用同一份）。
+# 这里保留同名别名，本模块其余代码与外部引用点都不用改。
+from app.text_tokens import SYNONYM_GROUPS as _SYNONYM_GROUPS, segments as _segments  # noqa: E402,F401
 
 
 def _parse_query(text: str) -> tuple[list[str], list[str]]:

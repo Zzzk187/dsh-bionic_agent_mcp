@@ -24,15 +24,20 @@
 
 同义词表只有一份
 ----------------
-`_SYNONYM_GROUPS` 和 `_segments` 直接从 `app.knowledge` 借。那份是照抄
+`_SYNONYM_GROUPS` 和 `_segments` 来自 `app.text_tokens`。那份是照抄
 `知识检索.ps1` 并实测到 38/38 的，记忆侧再抄一份只会让两边口径分叉——
 查询「压缩」时知识库认「compact」而记忆库不认，是最难查的那种不一致。
+（原来是从 `app.knowledge` 借私有名，两个业务模块互相借内部细节；
+抽到 text_tokens 后谁都不依赖谁。）
 """
 from __future__ import annotations
 
 import json
 
-from app.knowledge import _SYNONYM_GROUPS, _segments
+from app.text_tokens import (  # 同义词表与分词
+    SYNONYM_GROUPS as _SYNONYM_GROUPS,
+    segments as _segments,
+)
 
 # 与 `记忆检索.ps1` 的 `Score-Entry` 逐字对齐的三个权重。
 # 标题×6 远高于正文×2 不是随手定的：标题是这条记忆「讲什么」的浓缩，

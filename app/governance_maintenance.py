@@ -19,6 +19,7 @@ import json
 from datetime import datetime, timezone
 
 from app import db
+from app import vector_consistency
 from app.governance_rules import load_rules
 from app.governance_scoring import score_memory, archive_candidate
 from app.governance_conflicts import classify_pair, needs_review, lexical_similarity
@@ -31,10 +32,8 @@ from app.governance_service import (
     detect_conflicts, _active_rows, _similarity_matrix,
 )
 
-try:
-    from app import embeddings as emb
-except Exception:  # pragma: no cover
-    emb = None
+# 向量一致性检查已下沉到基础设施层 app/vector_consistency.py。
+# 本模块只做转发，避免「底层备份模块反向依赖上层治理编排」。
 
 
 def _parse_ts(value):
@@ -513,37 +512,8 @@ def get_governance_run(run_id: int) -> dict:
 def get_vector_consistency() -> dict:
     """Verify vector-index consistency with current content.
 
-    - Active memories missing a vector -> pending re-index.
-    - Active memories whose stored vector hash != current content -> stale.
-    - Archived memories must KEEP their vectors (we never delete on archive).
+    Implementation moved to `app.vector_consistency` (infrastructure layer) so
+    that `snapshots` no longer has to import this orchestration module. Kept as
+    a forwarding function because the MCP tool of the same name calls it.
     """
-    from app import embeddings as _emb
-    with db.connect() as conn:
-        rows = [db.rowdict(r) for r in conn.execute(
-            "SELECT m.id,m.status,m.content,e.content_hash AS stored_hash,"
-            "e.model_name FROM memories m LEFT JOIN memory_embeddings e "
-            "ON e.memory_id=m.id ORDER BY m.id").fetchall()]
-    active_no_vector = 0
-    stale = 0
-    archived_with_vector = 0
-    archived_no_vector = 0
-    for r in rows:
-        if r["status"] == "active":
-            if r["stored_hash"] is None:
-                active_no_vector += 1
-            elif _emb is not None and r["stored_hash"] != _emb.content_hash(r["content"] or ""):
-                stale += 1
-        elif r["status"] == "archived":
-            if r["stored_hash"] is not None:
-                archived_with_vector += 1
-            else:
-                archived_no_vector += 1
-    return {
-        "ok": True,
-        "active_without_vector": active_no_vector,
-        "active_stale_vector": stale,
-        "archived_with_vector_retained": archived_with_vector,
-        "archived_without_vector": archived_no_vector,
-        "embedding_available": emb is not None,
-        "message": "归档记忆的向量应被保留；活跃检索按 status 过滤，无需重算。",
-    }
+    return vector_consistency.get_vector_consistency()

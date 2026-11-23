@@ -131,6 +131,24 @@ function identifyAdmin(port, timeoutMs = 1500) {
 				res.on("data", (c) => chunks.push(c));
 				res.on("end", () => {
 					const text = Buffer.concat(chunks).toString("utf8");
+					if (res.statusCode === 401) {
+						// 管理面板可以开令牌认证（CLI --token / BIONIC_ADMIN_TOKEN）。
+						// 开了之后 /api/stats 对无令牌请求一律 401 —— 那是**认证**，
+						// 不是"端口上坐着别人"。两者后果天差地别：判成别人会让我们
+						// pickFreePort 另起一个实例，同一台机器上跑出两个管理服务、
+						// 同一份 agent.db 被两个进程打开。
+						//
+						// 所以这里看 401 里带的身份标记：服务端在 WWW-Authenticate 里
+						// 写了 realm="bionic-admin"，另加了 X-Bionic-Service。只认标记，
+						// 不认"任何 401" —— 别的服务也可能用 Bearer。
+						const www = String(res.headers?.["www-authenticate"] ?? "");
+						const sid = String(res.headers?.["x-bionic-service"] ?? "");
+						const mine = sid === "bionic-agent-admin" || www.includes("bionic-admin");
+						finish(mine
+							? { ours: true, needsToken: true, reason: "是 bionic 管理服务（已启用令牌认证）" }
+							: { ours: false, reason: "HTTP 401，但不是本服务（缺少 bionic 身份标记）" });
+						return;
+					}
 					if (res.statusCode !== 200) {
 						finish({ ours: false, reason: `HTTP ${res.statusCode}` });
 						return;
@@ -417,6 +435,10 @@ export function apply(ctx, config = {}) {
 				const who = await identifyAdmin(port);
 				if (who.ours) {
 					bootTrace(ctx, `${adminUrl} 已在运行，复用现有服务（会盯着它，停了就自己接管）`);
+					if (who.needsToken) {
+						// 别让用户以为插件坏了：面板能开，但要先在顶栏输令牌。
+						bootTrace(ctx, "该实例启用了令牌认证：面板页会在顶栏要求输访问令牌");
+					}
 					borrowed = true;
 					ensureHealthWatch();
 					return;
@@ -445,6 +467,9 @@ export function apply(ctx, config = {}) {
 				const who = await identifyAdmin(port);
 				if (who.ours) {
 					bootTrace(ctx, `管理服务已就绪 ${adminUrl}（${pythonHint(launched)}）`);
+					if (who.needsToken) {
+						bootTrace(ctx, "该实例启用了令牌认证：面板页会在顶栏要求输访问令牌");
+					}
 				} else {
 					bootTrace(ctx, `${adminUrl} 有响应但不是管理服务（${who.reason}），面板会显示空白`, "warn");
 				}

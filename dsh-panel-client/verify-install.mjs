@@ -119,6 +119,18 @@ async function probeAdmin(candidatePort, timeoutMs = 2500) {
 	const url = `http://127.0.0.1:${candidatePort}`;
 	try {
 		const res = await fetch(`${url}/api/stats`, { signal: AbortSignal.timeout(timeoutMs) });
+		// 管理面板可以开令牌认证（--token / BIONIC_ADMIN_TOKEN）。开了之后
+		// /api/stats 对无令牌请求回 401 —— 服务是好的，只是要令牌。自检若把它
+		// 当成"没探到"，就会误报「DSH 可能还没重启，或插件宿主半没生效」，
+		// 而这恰好是自检最该说准的一句话。认 401 里的身份标记，不认 body。
+		if (res.status === 401) {
+			const sid = String(res.headers.get("x-bionic-service") ?? "");
+			const www = String(res.headers.get("www-authenticate") ?? "");
+			if (sid === "bionic-agent-admin" || www.includes("bionic-admin")) {
+				return { url, data: undefined, needsToken: true };
+			}
+			return undefined;
+		}
 		if (!res.ok) return undefined;
 		const body = await res.json();
 		if (body?.ok === true && body?.data !== undefined && "memories_total" in body.data) {
@@ -132,11 +144,13 @@ async function probeAdmin(candidatePort, timeoutMs = 2500) {
 
 let adminUrl;
 let adminData;
+let adminNeedsToken = false;
 for (const candidate of PORT_SCAN) {
 	const hit = await probeAdmin(candidate);
 	if (hit) {
 		adminUrl = hit.url;
 		adminData = hit.data;
+		adminNeedsToken = hit.needsToken === true;
 		break;
 	}
 }
@@ -147,7 +161,15 @@ if (adminUrl) {
 		true,
 		`${adminUrl}${adminUrl.endsWith(":8899") ? "" : "（8899 被占，插件自动换到了这个端口）"}`
 	);
-	check("GET /api/stats 正常", true, JSON.stringify(adminData).slice(0, 120));
+	if (adminNeedsToken) {
+		check(
+			"GET /api/stats 需要访问令牌（认证已启用）",
+			true,
+			"401 + bionic 身份标记；面板打开后在顶栏输令牌即可"
+		);
+	} else {
+		check("GET /api/stats 正常", true, JSON.stringify(adminData).slice(0, 120));
+	}
 } else {
 	check(
 		"管理服务在监听",

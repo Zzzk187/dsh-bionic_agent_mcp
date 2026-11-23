@@ -406,7 +406,7 @@ def _dump_db_logical(db_path: Path, mode: str) -> tuple[dict, dict]:
     fd, tmp = tempfile.mkstemp(prefix="s1-dbcopy-", suffix=".db")
     os.close(fd)
     try:
-        src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        src = sqlite3.connect(_readonly_uri(db_path), uri=True)
         dst = sqlite3.connect(tmp)
         try:
             src.backup(dst)   # 隔离副本，生产库零写入

@@ -15,7 +15,11 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["app"]
+# OPT-03 3.1：拆出 app/mcp/ 之后这里必须是显式列表的两项。setuptools 的
+# `packages` 是**显式声明**，不是自动发现——写 ["app"] 时 app.mcp 不会被
+# 打进 wheel，pip 装出来的包一 import 就 ImportError，而 build_zip.py 走
+# rglob 是收全的，两条分发路径会悄悄分叉。新增子包时必须回来加一行。
+packages = ["app", "app.mcp", "app.mcp.stores"]
 
 [tool.setuptools.package-data]
 # S6-FINAL-FIX P1-2：`static/*` 是星图用的 3d-force-graph（1.39 MB，自包含

@@ -17,6 +17,7 @@ import sys
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
+import _env_guard  # noqa: E402,F401  OPT-04a：数据库隔离闸门（必须在任何 app.* 之前）
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))

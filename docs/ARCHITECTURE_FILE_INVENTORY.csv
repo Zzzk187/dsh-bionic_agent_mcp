@@ -1,0 +1,150 @@
+﻿path,type,bytes,lines,public_funcs,responsibility,references,target_path,move_advice,risk_level
+app/admin_ui.html,app-asset,117036,2287,0,管理面板前端单文件 2287 行,,app/api/templates/index.html,移动,P2
+app/__init__.py,app-module,0,0,0,包标记，空文件,0 处引用,app/,移动,P3
+app/activation_spreading.py,app-module,15566,320,7,激活扩散（图算法）,3 处引用：app/mcp_server.py; app/memory_lifecycle.py; tests/activation_test.py,app/memory/activation.py,移动,P3
+app/admin_ui.py,app-module,65018,1496,77,管理面板后端 75 路由（零鉴权）,4 处引用：tests/admin_backup_restore_test.py; tests/admin_host_guard_test.py; tests/timeline_test.py; tests/views_test.py,app/api/routes.py + app/api/app.py,移动+拆分,P1
+app/db.py,app-module,42425,911,7,数据库基础设施：连接/事务/WAL/迁移/schema 探测（唯一迁移入口）,49 处引用：app/activation_spreading.py; app/admin_ui.py; app/db_backup.py; app/distillation.py…,app/core/db.py,移动,P1
+app/db_backup.py,app-module,21453,549,7,物理备份：Connection.backup + 校验 + 保留清理,3 处引用：scripts/physical_backup.py; scripts/snapshot_db.py; tests/db_backup_test.py,app/backup/physical.py,移动,P1
+app/distillation.py,app-module,17574,393,3,经验提炼（模块级 import memory_lifecycle 造成 SCC）,3 处引用：app/admin_ui.py; app/mcp_server.py; tests/distillation_test.py,app/memory/distillation.py,移动,P2
+app/embeddings.py,app-module,6504,164,7,嵌入模型封装,17 处引用：app/admin_ui.py; app/distillation.py; app/governance_maintenance.py; app/governance_service.py…,app/core/embeddings.py,移动,P2
+app/expiry.py,app-module,9848,240,5,过期策略与降权,4 处引用：app/admin_ui.py; app/mcp_server.py; app/memory_lifecycle.py; tests/expiry_test.py,app/memory/expiry.py,移动,P3
+app/feedback_loop.py,app-module,9947,247,7,反馈信号回流评分,6 处引用：app/admin_ui.py; app/governance_scoring.py; app/governance_service.py; app/mcp_server.py…,app/memory/feedback.py,移动,P3
+app/governance_conflicts.py,app-module,10911,252,7,冲突检测（COEXISTING_CATEGORIES 6 项，与 rules 漂移）,4 处引用：app/governance_maintenance.py; app/governance_service.py; app/memory_lifecycle.py; tests/conflict_triage_test.py,app/governance/conflicts.py,移动,P1
+app/governance_maintenance.py,app-module,24234,549,6,治理闭环/整理计划,3 处引用：app/mcp_server.py; app/snapshots.py; tests/review_release_test.py,app/governance/maintenance.py,移动,P2
+app/governance_rules.py,app-module,9271,218,1,治理规则常量（COEXISTING_CATEGORIES 7 项）,8 处引用：app/activation_spreading.py; app/governance_maintenance.py; app/governance_scoring.py; app/governance_service.py…,app/governance/rules.py,移动,P2
+app/governance_scoring.py,app-module,17117,398,9,治理评分,7 处引用：app/activation_spreading.py; app/governance_maintenance.py; app/governance_service.py; app/memory_lifecycle.py…,app/governance/scoring.py,移动,P2
+app/governance_service.py,app-module,54594,1130,17,治理服务门面（53 处 SQL）,5 处引用：app/admin_ui.py; app/governance_maintenance.py; app/mcp_server.py; app/memory_lifecycle.py…,app/governance/service.py,移动,P2
+app/knowledge.py,app-module,59825,1362,11,知识库导入/检索/骨架（唯一硬编码 DSH_MEMORY_ROOT 默认值）,14 处引用：app/mcp_server.py; app/memory_lexical.py; app/portable_backup.py; app/portable_restore.py…,app/knowledge/index.py + app/knowledge/segments.py,移动+拆分,P1
+app/mcp_server.py,app-module,81684,1738,85,85 个 MCP 工具（26 个内嵌 SQL，1738 行）,21 处引用：app/admin_ui.py; app/mcp_server_gov.py; app/memory_lifecycle.py; scripts/dev/diag_cases.py…,app/mcp/registry.py + 分域 tools/*.py,建议拆分（分三期）,P1
+app/mcp_server_gov.py,app-module,1338,35,0,35 行转发入口：只起 mcp_gov 实例,1 处引用：tests/portable_restore_mcp_test.py,app/mcp/gov_entry.py,移动,P3
+app/memory_lexical.py,app-module,35137,695,10,纯词法算法 + 概念桥（零 SQL，边界清晰）,7 处引用：app/mcp_server.py; app/memory_lifecycle.py; scripts/dev/diag_cases.py; scripts/dev/diag_lexical.py…,app/memory/lexical.py,移动,P2
+app/memory_lifecycle.py,app-module,60416,1178,14,记忆生命周期 + 检索融合 + 39 处 SQL（职责混杂）,21 处引用：app/admin_ui.py; app/distillation.py; app/mcp_server.py; app/recall_profile.py…,app/memory/lifecycle.py（先拆 store）,移动+拆分,P1
+app/portable_backup.py,app-module,40132,981,8,便携包导出/校验/清单（含未编码 URI 缺陷）,7 处引用：app/admin_ui.py; app/mcp_server.py; app/portable_restore.py; tests/portable_backup_metadata_test.py…,app/backup/portable_export.py,移动,P1
+app/portable_restore.py,app-module,78743,1653,9,便携包恢复状态机（1653 行，重复 connect/transaction）,4 处引用：app/admin_ui.py; app/mcp_server.py; tests/portable_restore_mcp_test.py; tests/portable_restore_test.py,app/backup/portable_restore.py,移动,P1
+app/protection.py,app-module,7087,164,4,保护分档（只收紧不放松）,6 处引用：app/admin_ui.py; app/expiry.py; app/governance_scoring.py; app/mcp_server.py…,app/memory/protection.py,移动,P3
+app/recall_profile.py,app-module,8967,179,3,召回画像权重表 + clamp（零 SQL，顶层零 app 依赖）,4 处引用：app/admin_ui.py; app/memory_lifecycle.py; tests/fusion_test.py; tests/recall_profile_test.py,app/memory/recall_profile.py,移动,P3
+app/snapshots.py,app-module,25994,538,5,逻辑快照：dump/restore/prune + db_snapshots 表（越权建表）,7 处引用：app/admin_ui.py; app/mcp_server.py; app/portable_backup.py; app/portable_restore.py…,app/backup/logical.py,移动,P1
+app/star_map.py,app-module,15743,366,1,星图数据组装（被 admin_ui 独占引用）,1 处引用：app/admin_ui.py,app/api/star_map.py,移动,P3
+app/task_resume.py,app-module,11638,282,5,任务续跑与阶段快照,3 处引用：app/admin_ui.py; app/mcp_server.py; tests/task_resume_test.py,app/memory/tasks.py,移动,P3
+dsh-panel-client/assets/panel-icon.svg,panel,362,5,0,DSH 面板插件（Node 侧，独立发布单元）,,dsh-panel-client/assets/panel-icon.svg,保留,P3
+dsh-panel-client/cordis.patch.yml,panel,1366,20,0,DSH 面板插件（Node 侧，独立发布单元）,,dsh-panel-client/cordis.patch.yml,保留,P3
+dsh-panel-client/install.py,panel,6827,168,2,DSH 面板插件（Node 侧，独立发布单元）,,dsh-panel-client/install.py,保留,P3
+dsh-panel-client/lib/client.js,panel,15338,412,0,DSH 面板插件（Node 侧，独立发布单元）,,dsh-panel-client/lib/client.js,保留,P3
+dsh-panel-client/lib/index.js,panel,27003,688,0,DSH 面板插件（Node 侧，独立发布单元）,,dsh-panel-client/lib/index.js,保留,P3
+dsh-panel-client/package.json,panel,1020,43,0,DSH 面板插件（Node 侧，独立发布单元）,,dsh-panel-client/package.json,保留,P3
+dsh-panel-client/semver-lite.mjs,panel,3558,93,0,DSH 面板插件（Node 侧，独立发布单元）,,dsh-panel-client/semver-lite.mjs,保留,P3
+dsh-panel-client/test/adopt.mjs,panel,5786,139,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/adopt.mjs,保留,P3
+dsh-panel-client/test/all.mjs,panel,4768,144,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/all.mjs,保留,P3
+dsh-panel-client/test/asar-read.mjs,panel,3959,103,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/asar-read.mjs,保留,P3
+dsh-panel-client/test/client-smoke.mjs,panel,15053,359,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/client-smoke.mjs,保留,P3
+dsh-panel-client/test/deps.mjs,panel,2944,63,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/deps.mjs,保留,P3
+dsh-panel-client/test/extract-deps.mjs,panel,9548,235,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/extract-deps.mjs,保留,P3
+dsh-panel-client/test/host-cordis.mjs,panel,4293,123,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/host-cordis.mjs,保留,P3
+dsh-panel-client/test/host-webserver.mjs,panel,6807,203,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/host-webserver.mjs,保留,P3
+dsh-panel-client/test/layer-config.mjs,panel,3578,90,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/layer-config.mjs,保留,P3
+dsh-panel-client/test/locate-pkg.mjs,panel,4832,104,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/locate-pkg.mjs,保留,P3
+dsh-panel-client/test/port-conflict.mjs,panel,4963,131,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/port-conflict.mjs,保留,P3
+dsh-panel-client/test/proxy-mount.mjs,panel,11297,297,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/proxy-mount.mjs,保留,P3
+dsh-panel-client/test/self-heal.mjs,panel,5079,144,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/self-heal.mjs,保留,P3
+dsh-panel-client/test/semver-cases.json,panel,649,21,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/semver-cases.json,保留,P3
+dsh-panel-client/test/starmap-prefix.mjs,panel,4711,106,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/starmap-prefix.mjs,保留,P3
+dsh-panel-client/test/starmap.mjs,panel,9127,224,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/starmap.mjs,保留,P3
+dsh-panel-client/test/theme.mjs,panel,4467,79,0,面板客户端测试（.mjs，Node 侧）,,dsh-panel-client/test/theme.mjs,保留,P3
+dsh-panel-client/verify-install.mjs,panel,17391,329,0,DSH 面板插件（Node 侧，独立发布单元）,,dsh-panel-client/verify-install.mjs,保留,P3
+build_zip.py,root-tool,2823,89,2,打包脚本（不含 tests/，作发布物一致）,,tools/build_zip.py,移动,P2
+scripts/check_mirror.py,script,4768,119,1,镜像一致性检查,运维/评测入口，人工或计划任务调用,scripts/ops/check_mirror.py,移动,P3
+scripts/dev/_add_mem_dryrun.py,script,2397,52,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_add_recall_all.py,script,5003,125,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_add_record_access.py,script,2793,46,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_add_skeleton_roots.py,script,6042,156,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_evalks.py,script,4489,78,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_fix_cha_all.py,script,1668,35,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_fix_comment.py,script,1483,24,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_fix_docstring.py,script,565,14,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_fix_run_parse.py,script,1245,27,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_fix_search_fallback.py,script,3748,79,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_json_tail.py,script,1491,27,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_fix_eol.py,script,1827,52,2,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step10_map_readme.py,script,13001,249,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step11_agents.py,script,7378,86,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step12_memory_md.py,script,3055,53,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step13_fix_jsonline.py,script,2407,58,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step1_base.py,script,10300,230,2,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step2_moves.py,script,4076,102,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step3_wire.py,script,12276,208,2,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step3b_wire.py,script,12545,215,5,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step4a_check.py,script,7495,185,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step4b_selfcheck.py,script,8153,194,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step4c_fixroot.py,script,2851,66,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step5_mcp_paths.py,script,4264,95,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step6_scripts.py,script,2643,63,2,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step7_prune.py,script,4714,112,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step7b_prune_rule.py,script,4277,84,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step7c_prune_root.py,script,4395,90,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mod_step9_docs.py,script,9056,149,2,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_mute_touch.py,script,1480,25,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_patch_agents.py,script,1363,33,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_patch_role_split.py,script,6081,108,3,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_patch_tixi.py,script,2784,53,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_psref.py,script,10910,276,8,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_relax_root_assert.py,script,1917,50,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_rewrite_cha.py,script,3234,81,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_set_weights.py,script,656,14,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_tune_and_wait.py,script,3011,57,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_wire_fallback.py,script,1187,23,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/_wire_recall.py,script,1423,32,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/audit_memory_modules.py,script,4342,110,2,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/diag_cases.py,script,2384,62,2,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/diag_knowledge_sentence.py,script,4927,115,2,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/diag_lexical.py,script,2029,59,2,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/diag_order.py,script,1650,55,2,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/ps1_check.py,script,933,26,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/show_fails.py,script,912,21,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/title_recall.py,script,3015,89,2,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/tune_floor.py,script,2148,59,2,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/tune_weights.py,script,2245,70,2,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/wake_check.py,script,560,18,0,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/dev/warm.py,script,1379,40,1,个人调试脚本（未跟踪，不属交付物）,运维/评测入口，人工或计划任务调用,不建议入库,不移动,P3
+scripts/eval_lexical.py,script,3747,101,3,评测：词法,运维/评测入口，人工或计划任务调用,scripts/eval/lexical.py,移动,P3
+scripts/eval_local.py,script,2319,55,1,评测：本地,运维/评测入口，人工或计划任务调用,scripts/eval/local.py,移动,P3
+scripts/eval_recall.py,script,2852,69,1,评测：召回,运维/评测入口，人工或计划任务调用,scripts/eval/recall.py,移动,P3
+scripts/import_dsh_knowledge.py,script,3876,84,1,知识导入（dry-run 不建库）,运维/评测入口，人工或计划任务调用,scripts/imports/knowledge.py,移动,P2
+scripts/import_dsh_memory.py,script,11921,238,4,记忆导入（UPDATE 只写 6 列）,运维/评测入口，人工或计划任务调用,scripts/imports/memory.py,移动,P2
+scripts/physical_backup.py,script,6414,147,1,物理备份 CLI,运维/评测入口，人工或计划任务调用,scripts/ops/physical_backup.py,移动,P2
+scripts/recall.py,script,7114,168,3,命令行检索（recall_all CLI 版）,运维/评测入口，人工或计划任务调用,scripts/ops/recall.py,移动,P3
+scripts/snapshot_db.py,script,8860,182,1,05:00 计划任务入口：逻辑+物理备份,运维/评测入口，人工或计划任务调用,scripts/ops/snapshot_db.py,移动,P1
+scripts/sync_all.py,script,8738,193,1,本地→MCP 单向同步（唯一写入方向）,运维/评测入口，人工或计划任务调用,scripts/ops/sync_all.py,移动,P1
+tests/activation_test.py,test,7817,155,2,单元/回归测试：activation_test,由 tests/run_tests.py 统一发现并执行,tests/activation_test.py,保留,P3
+tests/admin_backup_restore_test.py,test,29181,535,11,单元/回归测试：admin_backup_restore_test,由 tests/run_tests.py 统一发现并执行,tests/admin_backup_restore_test.py,保留,P3
+tests/admin_host_guard_test.py,test,10676,256,7,单元/回归测试：admin_host_guard_test,由 tests/run_tests.py 统一发现并执行,tests/admin_host_guard_test.py,保留,P3
+tests/concept_bridge_diag_test.py,test,12720,314,5,单元/回归测试：concept_bridge_diag_test,由 tests/run_tests.py 统一发现并执行,tests/concept_bridge_diag_test.py,保留,P3
+tests/concept_bridge_test.py,test,12312,278,2,单元/回归测试：concept_bridge_test,由 tests/run_tests.py 统一发现并执行,tests/concept_bridge_test.py,保留,P3
+tests/concurrency_test.py,test,12285,301,7,单元/回归测试：concurrency_test,由 tests/run_tests.py 统一发现并执行,tests/concurrency_test.py,保留,P3
+tests/conflict_triage_test.py,test,12172,248,13,单元/回归测试：conflict_triage_test,由 tests/run_tests.py 统一发现并执行,tests/conflict_triage_test.py,保留,P3
+tests/cross_device_test.py,test,8808,199,5,单元/回归测试：cross_device_test,由 tests/run_tests.py 统一发现并执行,tests/cross_device_test.py,保留,P3
+tests/db_backup_test.py,test,26196,567,10,单元/回归测试：db_backup_test,由 tests/run_tests.py 统一发现并执行,tests/db_backup_test.py,保留,P3
+tests/distillation_test.py,test,13353,275,12,单元/回归测试：distillation_test,由 tests/run_tests.py 统一发现并执行,tests/distillation_test.py,保留,P3
+tests/embedding_test.py,test,2106,33,1,单元/回归测试：embedding_test,由 tests/run_tests.py 统一发现并执行,tests/embedding_test.py,保留,P3
+tests/expiry_test.py,test,11266,244,13,单元/回归测试：expiry_test,由 tests/run_tests.py 统一发现并执行,tests/expiry_test.py,保留,P3
+tests/feedback_loop_test.py,test,10413,218,9,单元/回归测试：feedback_loop_test,由 tests/run_tests.py 统一发现并执行,tests/feedback_loop_test.py,保留,P3
+tests/fusion_test.py,test,13540,303,11,单元/回归测试：fusion_test,由 tests/run_tests.py 统一发现并执行,tests/fusion_test.py,保留,P3
+tests/import_dsh_memory_test.py,test,11227,279,6,单元/回归测试：import_dsh_memory_test,由 tests/run_tests.py 统一发现并执行,tests/import_dsh_memory_test.py,保留,P3
+tests/init_db_probe_test.py,test,30429,797,26,单元/回归测试：init_db_probe_test,由 tests/run_tests.py 统一发现并执行,tests/init_db_probe_test.py,保留,P3
+tests/knowledge_test.py,test,13722,242,2,单元/回归测试：knowledge_test,由 tests/run_tests.py 统一发现并执行,tests/knowledge_test.py,保留,P3
+tests/lexical_test.py,test,8658,194,3,单元/回归测试：lexical_test,由 tests/run_tests.py 统一发现并执行,tests/lexical_test.py,保留,P3
+tests/portable_backup_metadata_test.py,test,24922,539,16,单元/回归测试：portable_backup_metadata_test,由 tests/run_tests.py 统一发现并执行,tests/portable_backup_metadata_test.py,保留,P3
+tests/portable_backup_test.py,test,18672,450,27,单元/回归测试：portable_backup_test,由 tests/run_tests.py 统一发现并执行,tests/portable_backup_test.py,保留,P3
+tests/portable_restore_mcp_test.py,test,14885,280,11,单元/回归测试：portable_restore_mcp_test,由 tests/run_tests.py 统一发现并执行,tests/portable_restore_mcp_test.py,保留,P3
+tests/portable_restore_test.py,test,38197,747,16,单元/回归测试：portable_restore_test,由 tests/run_tests.py 统一发现并执行,tests/portable_restore_test.py,保留,P3
+tests/protection_test.py,test,7488,160,9,单元/回归测试：protection_test,由 tests/run_tests.py 统一发现并执行,tests/protection_test.py,保留,P3
+tests/recall_profile_test.py,test,14044,291,13,单元/回归测试：recall_profile_test,由 tests/run_tests.py 统一发现并执行,tests/recall_profile_test.py,保留,P3
+tests/review_release_test.py,test,9797,223,14,单元/回归测试：review_release_test,由 tests/run_tests.py 统一发现并执行,tests/review_release_test.py,保留,P3
+tests/run_tests.py,test,8353,186,3,统一测试入口（33 项，CREATE_NEW_PROCESS_GROUP）,由 tests/run_tests.py 统一发现并执行,tests/run_tests.py,保留,P2
+tests/run_tests_optimize_test.py,test,6899,190,5,run_tests 的回归测试（PYTHONOPTIMIZE 防护）,由 tests/run_tests.py 统一发现并执行,tests/run_tests_optimize_test.py,保留,P2
+tests/semantic_test.py,test,12779,291,9,单元/回归测试：semantic_test,由 tests/run_tests.py 统一发现并执行,tests/semantic_test.py,保留,P3
+tests/smoke_test.py,test,1310,32,1,单元/回归测试：smoke_test,由 tests/run_tests.py 统一发现并执行,tests/smoke_test.py,保留,P3
+tests/snapshot_test.py,test,23970,468,15,单元/回归测试：snapshot_test,由 tests/run_tests.py 统一发现并执行,tests/snapshot_test.py,保留,P3
+tests/task_resume_test.py,test,9805,210,11,单元/回归测试：task_resume_test,由 tests/run_tests.py 统一发现并执行,tests/task_resume_test.py,保留,P3
+tests/timeline_test.py,test,6486,132,2,单元/回归测试：timeline_test,由 tests/run_tests.py 统一发现并执行,tests/timeline_test.py,保留,P3
+tests/verify_mcp_split_test.py,test,5401,101,1,单元/回归测试：verify_mcp_split_test,由 tests/run_tests.py 统一发现并执行,tests/verify_mcp_split_test.py,保留,P3
+tests/views_test.py,test,7079,141,2,单元/回归测试：views_test,由 tests/run_tests.py 统一发现并执行,tests/views_test.py,保留,P3

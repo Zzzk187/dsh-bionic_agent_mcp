@@ -30,6 +30,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+import _env_guard  # noqa: E402,F401  OPT-04a：数据库隔离闸门（必须在任何 app.* 之前）
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 

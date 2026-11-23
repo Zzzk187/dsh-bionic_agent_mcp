@@ -2,6 +2,7 @@
 import json, sys, tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import _env_guard  # noqa: E402,F401  OPT-04a：数据库隔离闸门（必须在任何 app.* 之前）
 from app import db
 from app.embeddings import cosine_similarity, content_hash
 

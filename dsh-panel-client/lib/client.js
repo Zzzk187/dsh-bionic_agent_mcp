@@ -68,7 +68,9 @@ window.__ModuleLoader__.load({
 			"panel.downHint": "插件会在 DSH 启动时自动拉起本机管理服务；没起来通常是下面几种原因，处理完点这个面板重新打开即可：",
 			"panel.downUrl": "服务地址",
 			"panel.downReason": "具体原因",
-			"panel.downLog": "若 Python 或依赖缺失，请在 bionic-agent 项目目录执行 pip install -r requirements.txt；日志见 data/admin_ui.log"
+			"panel.downLog": "若 Python 或依赖缺失，请在 bionic-agent 项目目录执行 pip install -r requirements.txt；日志见 data/admin_ui.log",
+			"panel.authTitle": "管理服务已就绪，但需要访问令牌",
+			"panel.authHint": "在下面的面板顶栏「访问令牌」框里填入令牌即可；它由 BIONIC_ADMIN_TOKEN 或 --token 配置"
 		};
 		const en = {
 			"entry.label": "Memory / Tasks",
@@ -79,7 +81,9 @@ window.__ModuleLoader__.load({
 			"panel.downHint": "The plugin starts the local admin service when DSH boots. When it is down, one of these is usually the cause; fix it and reopen this panel:",
 			"panel.downUrl": "Service",
 			"panel.downReason": "Reason",
-			"panel.downLog": "If Python or its dependencies are missing, run pip install -r requirements.txt in the bionic-agent project; the log is data/admin_ui.log"
+			"panel.downLog": "If Python or its dependencies are missing, run pip install -r requirements.txt in the bionic-agent project; the log is data/admin_ui.log",
+			"panel.authTitle": "The admin service is up but needs an access token",
+			"panel.authHint": "Enter the token in the panel's top-bar token field; it is configured by BIONIC_ADMIN_TOKEN or --token"
 		};
 
 		let runtimeTranslate = null;
@@ -199,8 +203,19 @@ window.__ModuleLoader__.load({
 				// 只认"我们自己的接口"应答：同源探测打到 DSH 自己的服务器时，
 				// 挂载没生效的回退处理器可能返回 200 + 一张 HTML 页面。只看 resp.ok
 				// 会把它当成服务就绪，于是 iframe 嵌进 DSH 界面自己、还不再重试。
+				// 管理服务可以开令牌认证：开了之后 /api/stats 对无令牌请求回 401。
+				// 那**也是我们的服务**，只是要令牌 —— 若把它当成"没起来"，面板会
+				// 一直探到 30 秒超时、最后挂一条"管理服务没有响应"，而实际上一切正常。
+				// 所以 401 要看身份标记（服务端在 WWW-Authenticate 里写了 bionic-admin，
+				// 另加了 X-Bionic-Service），认标记而不是"任何 401"。
 				const isOurApi = async (resp) => {
-					if (!resp || resp.ok !== true) return false;
+					if (!resp) return false;
+					if (resp.status === 401) {
+						const www = String(resp.headers?.get?.("www-authenticate") ?? "");
+						const sid = String(resp.headers?.get?.("x-bionic-service") ?? "");
+						return sid === "bionic-agent-admin" || www.includes("bionic-admin");
+					}
+					if (resp.ok !== true) return false;
 					if (typeof resp.json !== "function") return true;
 					try {
 						const body = await resp.json();
@@ -227,7 +242,7 @@ window.__ModuleLoader__.load({
 								if (cancelled) return;
 								if (await isOurApi(resp)) {
 									if (cancelled) return;
-									setStatus("ready");
+									setStatus(resp.status === 401 ? "auth" : "ready");
 									setDetail("");
 									setSrc(MOUNT_SRC);
 									if (attempt > 1) setReloadKey((n) => n + 1);
@@ -245,7 +260,7 @@ window.__ModuleLoader__.load({
 							if (cancelled) return;
 							if (await isOurApi(response)) {
 								if (cancelled) return;
-								setStatus("ready");
+								setStatus(response.status === 401 ? "auth" : "ready");
 								setDetail("");
 								setSrc(FALLBACK_ADMIN_URL);
 								// 只有"之前探失败过"才需要重挂 iframe；一路顺利就别动它。
@@ -281,7 +296,12 @@ window.__ModuleLoader__.load({
 						color: status === "down" ? "#6b4e00" : "#1f3a68",
 						font: "12px/1.6 ui-sans-serif, system-ui, \"Segoe UI\", sans-serif"
 					},
-					children: status === "down"
+					children: status === "auth"
+						? [
+							react_jsx_runtime.jsx("strong", { children: tt("panel.authTitle") }),
+							` — ${tt("panel.authHint")}`
+						]
+						: status === "down"
 						? [
 							react_jsx_runtime.jsx("strong", { children: tt("panel.downTitle") }),
 							` — ${tt("panel.downUrl")} ${FALLBACK_ADMIN_URL}（${tt("panel.downReason")}：${detail}）。`,

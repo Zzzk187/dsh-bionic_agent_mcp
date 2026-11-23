@@ -118,18 +118,56 @@ python -m venv .venv
 .venv/Scripts/python -m app.admin_ui --port 8900     # 只换端口，仍只监听本机
 # 或走安装好的入口
 bionic-agent-admin
+
+# 开启令牌认证（除首页与 /static/* 外，全部接口要求 Authorization: Bearer <令牌>）
+.venv/Scripts/python -m app.admin_ui --token "你的令牌"
+BIONIC_ADMIN_TOKEN="你的令牌" .venv/Scripts/python -m app.admin_ui   # 效果相同
 ```
 
-> **安全边界（请先读这段）**：面板**没有任何身份认证**，默认只绑定 `127.0.0.1`。
+> **安全边界（请先读这段）**：面板**默认没有任何身份认证**，默认只绑定 `127.0.0.1`。
 > 绑定非本机地址（`0.0.0.0` / `192.168.x.x` / 机器名）会被**拒绝启动**并退出码 2，
 > 因为那等于把「删记忆 / 恢复整库 / 导出备份」的接口交给同网段所有人。
 > 确实要暴露到局域网时必须显式授权，并自担风险：
 >
 > ```bash
-> .venv/Scripts/python -m app.admin_ui --host 0.0.0.0 --allow-remote
+> .venv/Scripts/python -m app.admin_ui --host 0.0.0.0 --allow-remote --token "你的令牌"
 > ```
 >
-> 此时会打印安全警告。`--allow-remote` 只是「你知道后果」的授权声明，**不是认证机制**。
+> 此时会打印安全警告。**绑定授权与令牌是两件独立的事，不能互相替代**：
+> `--allow-remote` 只是「你知道后果」的授权声明、**不是认证机制**；反过来，
+> 配了令牌也不能省掉 `--allow-remote`——远程绑定仍然要你显式声明。
+
+### 访问令牌（可选）
+
+只想「本机自己用」的话什么都不用配，行为和历史版本完全一致。若这个端口不是只有你能碰
+（远程、别人共用一台机器、或你想给自己加道锁），就配一个令牌：
+
+| 方式 | 写法 | 优先级 |
+| --- | --- | --- |
+| 命令行 | `--token <令牌>` | 高 |
+| 环境变量 | `BIONIC_ADMIN_TOKEN=<令牌>` | 低 |
+| 都不配 | —— | 认证关闭（历史行为） |
+
+开启后：首页与 `/static/*` 仍然公开（否则页面本身打不开），**其余全部接口**（含
+`/docs`、`/openapi.json`）都要求 `Authorization: Bearer <令牌>`，否则 401。
+
+浏览器里怎么用：打开面板后顶栏右侧会多出「访问令牌」输入框，填同一个令牌即可。
+令牌**只存在这个页面的内存变量里**——不写 `localStorage`/`sessionStorage`、不进 URL、
+不进 Cookie、不写库、不打日志。代价是刷新或重开页面要重填一次；这个代价值得付，
+落到 storage 里同源下任何脚本都能读走。
+
+几条实测出来的注意点：
+
+- **令牌只能用 ASCII**（字母数字与 `-_.~` 等）。HTTP 头值本身只能是 ASCII，
+  中文令牌浏览器根本发不出去，现场表现是「令牌明明对、却全 401」——
+  所以服务端会在启动时就把这种令牌拒掉（退出码 2），而不是让你去猜。
+- 令牌首尾的空白会被自动裁掉（粘贴自带空格不算错）；控制字符会被拒绝。
+- 令牌走的是**明文 HTTP**。远程场景请务必置于 HTTPS 反代之后，或只用 SSH 隧道转发。
+- 更换令牌后刷新页面、在输入框里重填即可；清空输入框等于退回「不带令牌」。
+
+> 注意区分两层保护：`dsh-panel-client` 插件在**反代层**另有一道写保护
+> （只允许从 DSH 自己的窗口发起写操作），它只对经由插件挂载的路径 `/<mount>` 生效，
+> 对直连 `8899` 无效。后端令牌认证与之互补、不冲突。
 
 浏览器打开 `http://127.0.0.1:8899` 即可。面板直接用 `app.*` 的现成函数读写与 MCP 同一份
 数据库，因此**和 MCP 工具完全等价、实时同步**——在面板里改的记忆，MCP 工具立刻能读到。
@@ -599,9 +637,21 @@ B: DSH 桌面版每次重启端口都会变，这次是 51366
 | `tests/init_db_probe_test.py` | 初始化只读探测：已建库走只读路径且 sha256/size/mtime_ns 不变、新库正常、缺表/缺列/旧版本/半初始化能识别并安全迁移、损坏与锁冲突明确报错、并发幂等（94 项） |
 | `tests/db_backup_test.py` | SQLite 物理备份：基本/WAL/失败安全/保留策略/边界，备份可独立打开、验证失败不删历史、干扰文件不受影响（104 项） |
 | `tests/portable_backup_metadata_test.py` | 便携备份元数据读取隔离：指定 db_path 读取、多库互不干扰、全程不连生产库、库不存在不建空库、WAL 可见性、零附带 sidecar（90 项） |
+| `tests/import_dsh_memory_test.py` | 本地→库同步的数据保真：不重置 MCP 派生的 `access_count`/`last_accessed_at`、源 status 显式映射、未知状态上报不静默、archived 不复活、库内独有记忆不被普通同步删（29 项） |
+| `tests/cross_device_test.py` | 跨设备路径：`knowledge_docs` 以 `(root, rel_path)` 稳定键定位（换盘符不误判 missing）、`reanchor_paths()` 重锚绝对路径（dry-run 不写、应用后只改 path、hash 校验、冲突分类、事务可回滚）、`BIONIC_DB_PATH` 统一（19 项） |
+| `tests/portable_backup_test.py` | 便携包导出（S1）：四模式矩阵、大小写路径、ZIP 炸弹、未知高版本、缺 manifest/checksums、敏感文件排除、异常清理、DB 隔离（56 项） |
+| `tests/portable_restore_test.py` | 便携包恢复引擎（S2）：preview→confirm→execute 状态机、一次性令牌（过期/一次性/目标变化）、merge 与 full_replace、三种冲突策略、失败自动回滚（64 项） |
+| `tests/portable_restore_mcp_test.py` | 恢复类 MCP 工具（S3）：7 个工具是 S1/S2 的薄封装、不自行实现不绕过、令牌真实性、无路径逃逸、工具数 36/49/85（29 项） |
+| `tests/fusion_test.py` | 融合排序守门（S5-E）：权重表满足设计约束、frequency 只吃真实使用反馈绝不吃曝光、`_explain` 能复现 `_score`、`min_score` 默认关闭、空结果不伪装（32 项） |
+| `tests/semantic_test.py` | 语义检索守门（S5-D）：原始余弦不标定且与 `cosine_similarity` 逐条一致、`content_hash` 不符的向量必须跳过、`model_name` 不符必须过滤、`pending_review` 不进检索（25 项） |
 | `tests/admin_backup_restore_test.py` | 管理面板「备份与恢复中心」：8 类路由、一次性令牌只存内存、full_replace 强确认、状态机各分支（104 项） |
 | `tests/admin_host_guard_test.py` | 面板绑定守卫：本机地址放行、远程必须显式 `--allow-remote` 否则 exit 2、拒绝路径零数据库触碰（64 项） |
 | `tests/run_tests_optimize_test.py` | 测试入口抗优化：外部设 `PYTHONOPTIMIZE=1` 时断言不被剥离、`_env()` 清空该变量、三个裸 assert 套件不假通过（12 项） |
+| `tests/readonly_uri_test.py` | SQLite 只读 URI 编码：普通/空格/中文/`#`/`%`/`?`/混合/多级目录八类路径正确读取、`mode=ro` 写被拒且文件指纹不变、不存在的库只报错不建文件、URI 形状（`%23`/`%25`/`%3F`/`%20`、单 `?`、前导斜杠）、旧写法反证、8 个调用点经业务函数验证（77 项） |
+| `tests/admin_token_auth_test.py` | 面板可选令牌认证：CLI > 环境变量 > 关闭三档优先级、非 ASCII 令牌启动期拒绝、拒绝/放行矩阵、令牌不入 body/日志/URL、CORS 预检、远程绑定与令牌互相独立不可替代（113 项） |
+| `tests/admin_auth_frontend_test.py` | 前端认证链路：401 身份头、公开路径不许扩张、前端只有一个网络出口、令牌只存内存不落 storage、备份恢复三阶段都带头、插件三消费方认 401（77 项） |
+| `tests/db_isolation_test.py` | 测试库隔离：全部套件都带闸门且早于 app 导入、沙箱在项目根内且装真实语料、运行器 `_env()` 五分支、子进程直跑也隔离、伪隔离（把 `BIONIC_DB_PATH` 指向生产库/相对路径/全大写/空白）必须被接管、生产库 SHA-256 与 sidecar 全程不变（47 项） |
+| `tests/mcp_tools_smoke_test.py` | MCP 工具层冒烟：49 个「零测试调用」工具各真调一遍，卡住返回契约（类型、关键字段、`_tool_result` 外壳、错误分支），并静态核对 49 个全覆盖不许精简掉（58 项） |
 
 示例用法：
 
@@ -609,7 +659,7 @@ B: DSH 桌面版每次重启端口都会变，这次是 51366
 # Node 侧（面板/插件）一把跑完
 node dsh-panel-client/test/all.mjs
 
-# Python 侧：统一入口，跑全部 33 个套件（每项独立子进程 + 超时）
+# Python 侧：统一入口，跑全部 38 个套件（每项独立子进程 + 超时）
 python tests/run_tests.py
 python tests/run_tests.py --list                       # 只看会跑哪些
 python tests/run_tests.py --only lexical,concept_bridge  # 只跑指定的几项

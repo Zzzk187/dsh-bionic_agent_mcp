@@ -226,7 +226,7 @@ def _db_fingerprint(db_path: Path) -> dict:
     if not p.is_file():
         return out
     try:
-        conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
+        conn = sqlite3.connect(_pb._readonly_uri(p), uri=True, timeout=5)
         try:
             out["user_version"] = conn.execute("PRAGMA user_version").fetchone()[0]
             row = conn.execute("PRAGMA integrity_check").fetchone()
@@ -393,7 +393,7 @@ def inspect_restore_target(*, db_path=None, source_root=None) -> dict:
     }
     if p.is_file():
         try:
-            conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
+            conn = sqlite3.connect(_pb._readonly_uri(p), uri=True, timeout=5)
             conn.row_factory = sqlite3.Row
             try:
                 tables = set(_snap._data_tables(conn))
@@ -651,7 +651,7 @@ def preview_restore(
         p = _default_db_path(db_path)
         if p.is_file():
             try:
-                conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
+                conn = sqlite3.connect(_pb._readonly_uri(p), uri=True, timeout=5)
                 conn.row_factory = sqlite3.Row
                 try:
                     live_tables = set(_snap._data_tables(conn))
@@ -792,7 +792,7 @@ def _create_protective_backup(restore_id: str, *, source_root, db_path,
     try:
         if dbp.is_file():
             dst = this / "agent.db"
-            src_conn = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True, timeout=10)
+            src_conn = sqlite3.connect(_pb._readonly_uri(dbp), uri=True, timeout=10)
             dst_conn = sqlite3.connect(str(dst))
             try:
                 src_conn.backup(dst_conn)
@@ -915,7 +915,7 @@ def _validate_snapshot_against_db(snap: dict, db_path=None) -> dict:
     fd, tmp = tempfile.mkstemp(prefix="s2-snapcheck-", suffix=".db")
     os.close(fd)
     try:
-        src = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=10)
+        src = sqlite3.connect(_pb._readonly_uri(p), uri=True, timeout=10)
         dst = sqlite3.connect(tmp)
         try:
             src.backup(dst)   # 隔离副本
@@ -1320,7 +1320,7 @@ def verify_restored_state(restore_id: str, *, db_path, source_root,
         out["errors"].append("目标数据库不存在")
         return out
     try:
-        conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=10)
+        conn = sqlite3.connect(_pb._readonly_uri(p), uri=True, timeout=10)
         conn.row_factory = sqlite3.Row
         try:
             integ = conn.execute("PRAGMA integrity_check").fetchone()[0]
@@ -1414,7 +1414,7 @@ def rollback_restore(restore_id: str, *, file_undo: list[dict], backup_dir,
     try:
         if backup_db.is_file():
             dst = sqlite3.connect(str(db_path))
-            src = sqlite3.connect(f"file:{backup_db}?mode=ro", uri=True)
+            src = sqlite3.connect(_pb._readonly_uri(backup_db), uri=True)
             try:
                 src.backup(dst)   # 用备份覆盖目标库（单事务原子写）
                 dst.commit()

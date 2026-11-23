@@ -490,7 +490,7 @@ def check_vector_consistency_after_restore() -> dict:
     turn a fast rollback into a long silent operation.
     """
     try:
-        from app.governance_maintenance import get_vector_consistency
+        from app.vector_consistency import get_vector_consistency
         base = get_vector_consistency()
     except Exception as exc:
         return {"ok": False, "needs_reindex": False,

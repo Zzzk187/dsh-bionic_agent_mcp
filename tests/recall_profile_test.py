@@ -21,6 +21,7 @@ TMP = tempfile.mkdtemp(prefix="bionic-recall-profile-test-")
 os.environ["BIONIC_DB_PATH"] = str(Path(TMP) / "agent.db")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+import _env_guard  # noqa: E402,F401  OPT-04a：数据库隔离闸门（必须在任何 app.* 之前）
 
 from app import db  # noqa: E402
 from app import mcp_server as mcp  # noqa: E402

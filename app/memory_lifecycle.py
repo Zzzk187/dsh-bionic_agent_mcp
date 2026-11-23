@@ -38,7 +38,10 @@ from app import activation_spreading as spreading
 from app import memory_lexical
 
 # Governance columns are stripped from recall output so the fused retrieval
-# stays compatible with the Phase 1-4 response shape. Mirrors mcp_server._memory_out.
+# stays compatible with the Phase 1-4 response shape.
+# OPT-02-B1: 这份集合与 `mcp_server.GOVERNANCE_COLUMNS` 取值相同，但两处是
+# 各写各的常量、互不 import —— 业务层不能为了一个常量反向依赖入口层。
+# 两边的行整形（剥列 + 解析 tags）已用 11 项对拍验证输出逐键一致。
 _GOV_COLUMNS = {
     "importance_score", "confidence_score", "freshness_score", "access_count",
     "last_accessed_at", "last_evaluated_at", "memory_status", "protected",
@@ -62,29 +65,15 @@ def _clean(row: dict) -> dict:
 # --------------------------------------------------------------------------
 LIFECYCLE_RULE_VERSION = "phase6-lifecycle-v1"
 
-# Recall fusion weights (sum-normalised at query time). These are stable rules,
-# not adaptive weights: the task forbids adaptive ranking unless enough feedback
-# exists AND it is validated; we ship stable rules so recall is reproducible.
-#
-# 2026-11-16 (S5-E): relevance share raised 0.55 -> 0.8652, measured on the
-# 41-answer set through the real `recall_profile` clamp path:
-#   R@1 0.6585 -> 0.7317 (+0.0732), MRR@5 0.7724 -> 0.8211 (+0.0487),
-#   nDCG@5 0.8118 -> 0.8484 (+0.0366), R@3/R@5 unchanged (0.9268 both).
-# The gain does not come from "adding relevance" but from *not double counting*
-# the governance columns: `importance_score` already folds frequency (0.25) and
-# confidence (0.20) into itself, so keeping both the aggregate and its inputs at
-# full weight fed the same signal in twice. Every component keeps a non-zero
-# weight -- relevance dominates, the priors only break ties. See
-# S5E_IMPLEMENTATION_REPORT.md for the full A/T1..T4 ablation table.
-RECALL_WEIGHTS = {
-    "semantic": 0.27,
-    "keyword": 0.60,
-    "importance": 0.03,
-    "confidence": 0.03,
-    "freshness": 0.03,
-    "frequency": 0.02,
-    "activation": 0.02,
-}
+# Recall fusion weights live in `app/recall_weights` (OPT-02-D). They used to be
+# defined right here, which meant `recall_profile` -- a module this file imports --
+# had to lazily import *back* into this one just to read the default table. The
+# table is a pure value with no imports or side effects, so moving it out removes
+# that back-edge instead of hiding it behind a deferred import. The name is
+# re-exported below because callers and tests read `memory_lifecycle.RECALL_WEIGHTS`
+# (tests/fusion_test.py, tests/recall_profile_test.py); the values and their
+# meaning are unchanged, and the S5-E rationale now lives in recall_weights.py.
+from app.recall_weights import RECALL_WEIGHTS  # noqa: E402
 
 # Feedback nudge for the fused score. Deliberately tiny and its own component
 # rather than folded into "confidence" (which already absorbs feedback through
@@ -435,6 +424,218 @@ def _semantic_scores(conn, query: str) -> dict[int, float]:
     return out
 
 
+def _recall_candidates(c, query: str, category: str, memory_type: str,
+                       explain: bool) -> tuple:
+    """取候选集，并算出打分的各项原料。只取数算分，不排序、不写库。
+
+    返回 (rows, sem, lex, lex_diag, spread, fb_rows)。
+    """
+    sql = ("SELECT * FROM memories WHERE status='active' "
+           "AND memory_status NOT IN ('pending_review', 'superseded')")
+    args: list = []
+    if category.strip():
+        sql += " AND category=?"
+        args.append(category.strip()[:100])
+    if memory_type.strip() and memory_type.strip() != "unknown":
+        sql += " AND memory_type=?"
+        args.append(memory_type.strip())
+    sql += " ORDER BY id"
+    rows = c.execute(sql, args).fetchall()
+
+    sem = _semantic_scores(c, query)
+    # 词法分换成字段加权版（标题×6 / 标签×4 / 正文×2，移植自
+    # `记忆检索.ps1`）。它按批归一化，所以先对全体候选算一次。
+    #
+    # S6-FIX-06：`lex_diag` 是概念桥的只读诊断出参（命中数/命中 id/
+    # 跨 seed 阈值数）。它**只被写、不被读来改分**：`lex` 的取值路径与
+    # 加诊断前完全相同。仅在 explain=True 时随结果回显。
+    #
+    # S6-FINAL-FIX P2-2：explain=False 时传 None 而不是空 dict。以前
+    # 无条件建 {} 并传下去，等于每次检索都白跑一遍诊断记账、只是不回显；
+    # 现在 None 让 apply_concept_bridge 里的 `want_diag` 直接为假。
+    lex_diag: dict | None = {} if explain else None
+    lex = _lexical_scores(query, rows, lex_diag)
+    seeds = [d["id"] for d in rows
+             if (sem.get(d["id"]) is not None and sem.get(d["id"]) >= 0.45)
+             or lex.get(d["id"], 0.0) >= memory_lexical.LEX_SEED_THRESHOLD]
+    # Even when nothing in the query hits hard enough to be a seed, usage
+    # history still has something to say: a memory that keeps getting read
+    # seeds its neighbours. Short-circuiting on an empty seed list, as this
+    # used to, made the usage-seed path dead code for precisely the vague
+    # queries that need it most -- only well-matched queries ever spread.
+    spread = (spreading.activation_for_seed_query(c, seeds) if seeds
+              else spreading.compute_activation(conn=c).get("activation", {}))
+    # One query for every feedback row instead of one per candidate: the
+    # feedback table is small and N+1 lookups here would be the hot path.
+    fb_rows = {}
+    try:
+        for fb in c.execute("SELECT * FROM memory_feedback").fetchall():
+            fb_rows[fb["memory_id"]] = feedback_loop._counts(fb)
+    except Exception:
+        fb_rows = {}
+    return rows, sem, lex, lex_diag, spread, fb_rows
+
+
+def _recall_score_one(d: dict, *, weights: dict, shape: str,
+                      profile_name: str, profile_reasons: list,
+                      lex: dict, sem: dict, spread: dict, fb_rows: dict,
+                      explain: bool, lex_diag: dict | None) -> dict:
+    """给一条候选算融合分并整形。纯计算，不排序、不写库。
+
+    `parts` 的键序、`sum(... for k in weights)` 的累加序、`round(total, 6)`
+    的位置都是排序可复现性的一部分，改动前先读 OPT_02 报告。
+    """
+    kw = lex.get(d["id"], 0.0)
+    sm = sem.get(d["id"])
+    imp = float(d.get("importance_score") or 0.0)
+    conf = float(d.get("confidence_score") or 0.0)
+    fr = float(d.get("freshness_score") or 0.0)
+    freq = _usage_freq(fb_rows.get(d["id"]))
+    act = spread.get(d["id"], {}).get("activation", 0.0)
+    if d["id"] in fb_rows:
+        fb_info = feedback_loop.compute_signal(fb_rows[d["id"]])
+        fb_term = feedback_loop.recall_bonus(fb_info["signal"]) if fb_info["applied"] else 0.0
+    else:
+        fb_info = None
+        fb_term = 0.0
+    parts = {
+        "semantic": (sm if sm is not None else 0.0),
+        "keyword": kw,
+        "importance": imp / 100.0,
+        "confidence": conf / 100.0,
+        "freshness": fr / 100.0,
+        "frequency": freq / 100.0,
+        "activation": act,
+        "feedback": fb_term,
+    }
+    total = sum(parts[k] * weights[k] for k in weights)
+    total += parts["feedback"] * RECALL_FEEDBACK_WEIGHT
+    # Per-candidate soft prior: a "how do I" question gives a memory
+    # typed `procedural` a nudge; it never excludes anything.
+    mtype_mult = recall_profile.type_multiplier(d.get("memory_type") or "", shape)
+    if mtype_mult != 1.0:
+        total *= mtype_mult
+    # Expiry demotes, never removes. A memory past its stated shelf life
+    # is usually still *true*, just no longer current -- so it keeps its
+    # content and just ranks lower, and the caller is told why.
+    exp_penalty = expiry.recall_penalty(d.get("expires_at"))
+    if exp_penalty:
+        total -= exp_penalty
+    rec = _clean(d)
+    rec["_score"] = round(total, 6)
+    if exp_penalty:
+        rec["_expired"] = True
+        rec["_expiry_penalty"] = exp_penalty
+    if explain:
+        # 6dp, not 4dp: `_score` is rounded to 6dp, so explain has to be
+        # at least as precise for a caller to recompute it. At 4dp the
+        # rounding error was ~2e-5 once a single component carried a
+        # large weight (keyword 0.61), which made `_explain` unable to
+        # reproduce `_score` -- i.e. the ranking stopped being auditable.
+        rec["_explain"] = {k: round(v, 6) for k, v in parts.items()}
+        rec["_weights"] = dict(weights, feedback=RECALL_FEEDBACK_WEIGHT)
+        rec["_profile"] = profile_name
+        rec["_profile_reasons"] = profile_reasons
+        rec["_frequency_source"] = (
+            "usage_feedback" if freq > 0 else "none"
+        )
+        rec["_access_count_observed"] = int(d.get("access_count") or 0)
+        rec["_type_multiplier"] = mtype_mult
+        rec["_semantic_available"] = sm is not None
+        # S6-FIX-06：概念桥只读诊断。整批一份，每条结果回显同一份，
+        # 与 `_weights` / `_profile` 的处理方式一致（它们也是每次查询
+        # 一份）。不含任何查询原文，只说「命中了几条、是哪几条」。
+        if lex_diag:
+            rec["_bridge"] = dict(lex_diag)
+        rec["_activation"] = {
+            "amount": round(act, 4),
+            "contributions": spread.get(d["id"], {}).get("contributions", []),
+        }
+        if fb_info is not None:
+            rec["_feedback"] = {
+                "signal": fb_info["signal"],
+                "applied": fb_info["applied"],
+                "counts": fb_rows[d["id"]],
+                "reason": fb_info["reason"],
+            }
+    return rec
+
+
+def _recall_rank(scored: list, top_k: int, min_score: float | None,
+                 explain: bool) -> tuple:
+    """排序、截断、可选相关性门槛。返回 (result, terminal)。
+
+    terminal=True 表示调用方应直接把 result 返回、跳过 include_related 与
+    记账——原实现在被门槛全拒时就是 `return` 的，行为必须一致。
+    """
+    # Stable sort: highest score first, then recency, then id.
+    scored.sort(key=lambda x: (x["_score"], x.get("updated_at") or "", x["id"]),
+                reverse=True)
+    result = scored[:top_k]
+    # Optional relevance floor. DELIBERATELY OPT-IN (default None = off).
+    #
+    # S5-E measured whether a fixed score threshold can tell related from
+    # unrelated queries on the 45-query set: it cannot. Related top1 scores
+    # span 0.3707..0.7765 and unrelated top1 span 0.3583..0.4813 -- a real
+    # preference query ("我是什么样的人设") scores 0.3707, BELOW three of the
+    # four unrelated queries. Every threshold that suppressed the unrelated
+    # ones also rejected 6..10 legitimate queries; the best joint rule still
+    # rejected 1/41 related while keeping only 2/4 unrelated. Shipping any of
+    # them as a default would silently drop good memories, so we ship the
+    # mechanism and leave it disarmed rather than pick a number that looks
+    # good on 4 negative samples.
+    #
+    # When a caller does arm it, the rejection is *explicit*: an empty list
+    # plus a `_rejected` audit block, never a silently short list.
+    if min_score is not None and result:
+        kept = [r for r in result if r["_score"] >= min_score]
+        if not kept:
+            top = result[0]
+            rejected = {
+                "reason": "below_min_score",
+                "min_score": min_score,
+                "best_score": top["_score"],
+                "best_id": top["id"],
+                "considered": len(result),
+                "message": (
+                    "没有足够相关的记忆：最佳候选分数 %.4f 低于门槛 %.4f。"
+                    % (top["_score"], min_score)
+                ),
+            }
+            if explain:
+                rejected["best_explain"] = {
+                    k: v for k, v in top.items() if k.startswith("_")
+                }
+            return ([{"_rejected": rejected}] if explain else []), True
+        result = kept
+    return result, False
+
+
+def _recall_attach_related(c, result: list) -> None:
+    """把一跳关系子图挂到每条结果上（原地改）。"""
+    ids = [r["id"] for r in result]
+    related = _related_subgraph(c, ids, max_depth=1)
+    for r in result:
+        r["_related"] = related.get(r["id"], [])
+
+
+def _recall_touch(result: list, record_access: bool) -> None:
+    """记一次真实访问（只加 access_count / last_accessed_at）。
+
+    放在拿到 result 之后：记的是"真正返回给调用方的那些"，而不是
+    "参与打分的全部候选"。
+    `record_access=False` 是给评测用的：access_count 会反过来
+    喂 frequency 分量，同一套题跑两遍第二遍就是在用上一遍刷
+    出来的数字打分（实测 @1 6/8 → 4/8，差别只在跑过什么）。
+    """
+    if result and record_access:
+        try:
+            from app import governance_service as _gov
+            _gov.touch_access([r["id"] for r in result])
+        except Exception:  # noqa: BLE001 —— 记账失败不该让召回本身失败
+            pass
+
+
 def recall_memories(query: str = "", top_k: int = 5, category: str = "",
                     memory_type: str = "", include_related: bool = False,
                     explain: bool = False, conn=None,
@@ -446,6 +647,10 @@ def recall_memories(query: str = "", top_k: int = 5, category: str = "",
     freshness/frequency) and optional relation boosting. Never returns
     archived, pending_review or superseded memories. Stable ordering: tie-break
     by (updated_at desc, id desc).
+
+    编排顺序（不可调整，每一步都影响可复现性）：
+      取候选与原料 → 逐条算分 → 排序截断（可能被门槛全拒）→
+      挂关系子图 → 记访问。
     """
     top_k = max(1, min(int(top_k), 50))
 
@@ -457,186 +662,24 @@ def recall_memories(query: str = "", top_k: int = 5, category: str = "",
     shape = profile["shape"]
 
     def _run(c):
-        sql = ("SELECT * FROM memories WHERE status='active' "
-               "AND memory_status NOT IN ('pending_review', 'superseded')")
-        args: list = []
-        if category.strip():
-            sql += " AND category=?"
-            args.append(category.strip()[:100])
-        if memory_type.strip() and memory_type.strip() != "unknown":
-            sql += " AND memory_type=?"
-            args.append(memory_type.strip())
-        sql += " ORDER BY id"
-        rows = c.execute(sql, args).fetchall()
-
-        sem = _semantic_scores(c, query)
-        # 词法分换成字段加权版（标题×6 / 标签×4 / 正文×2，移植自
-        # `记忆检索.ps1`）。它按批归一化，所以先对全体候选算一次。
-        #
-        # S6-FIX-06：`lex_diag` 是概念桥的只读诊断出参（命中数/命中 id/
-        # 跨 seed 阈值数）。它**只被写、不被读来改分**：`lex` 的取值路径与
-        # 加诊断前完全相同。仅在 explain=True 时随结果回显。
-        #
-        # S6-FINAL-FIX P2-2：explain=False 时传 None 而不是空 dict。以前
-        # 无条件建 {} 并传下去，等于每次检索都白跑一遍诊断记账、只是不回显；
-        # 现在 None 让 apply_concept_bridge 里的 `want_diag` 直接为假。
-        lex_diag: dict | None = {} if explain else None
-        lex = _lexical_scores(query, rows, lex_diag)
-        seeds = [d["id"] for d in rows
-                 if (sem.get(d["id"]) is not None and sem.get(d["id"]) >= 0.45)
-                 or lex.get(d["id"], 0.0) >= memory_lexical.LEX_SEED_THRESHOLD]
-        # Even when nothing in the query hits hard enough to be a seed, usage
-        # history still has something to say: a memory that keeps getting read
-        # seeds its neighbours. Short-circuiting on an empty seed list, as this
-        # used to, made the usage-seed path dead code for precisely the vague
-        # queries that need it most -- only well-matched queries ever spread.
-        spread = (spreading.activation_for_seed_query(c, seeds) if seeds
-                  else spreading.compute_activation(conn=c).get("activation", {}))
-        # One query for every feedback row instead of one per candidate: the
-        # feedback table is small and N+1 lookups here would be the hot path.
-        fb_rows = {}
-        try:
-            for fb in c.execute("SELECT * FROM memory_feedback").fetchall():
-                fb_rows[fb["memory_id"]] = feedback_loop._counts(fb)
-        except Exception:
-            fb_rows = {}
-        scored = []
-        for row in rows:
-            d = dict(row)
-            kw = lex.get(d["id"], 0.0)
-            sm = sem.get(d["id"])
-            imp = float(d.get("importance_score") or 0.0)
-            conf = float(d.get("confidence_score") or 0.0)
-            fr = float(d.get("freshness_score") or 0.0)
-            freq = _usage_freq(fb_rows.get(d["id"]))
-            act = spread.get(d["id"], {}).get("activation", 0.0)
-            if d["id"] in fb_rows:
-                fb_info = feedback_loop.compute_signal(fb_rows[d["id"]])
-                fb_term = feedback_loop.recall_bonus(fb_info["signal"]) if fb_info["applied"] else 0.0
-            else:
-                fb_info = None
-                fb_term = 0.0
-            parts = {
-                "semantic": (sm if sm is not None else 0.0),
-                "keyword": kw,
-                "importance": imp / 100.0,
-                "confidence": conf / 100.0,
-                "freshness": fr / 100.0,
-                "frequency": freq / 100.0,
-                "activation": act,
-                "feedback": fb_term,
-            }
-            total = sum(parts[k] * weights[k] for k in weights)
-            total += parts["feedback"] * RECALL_FEEDBACK_WEIGHT
-            # Per-candidate soft prior: a "how do I" question gives a memory
-            # typed `procedural` a nudge; it never excludes anything.
-            mtype_mult = recall_profile.type_multiplier(d.get("memory_type") or "", shape)
-            if mtype_mult != 1.0:
-                total *= mtype_mult
-            # Expiry demotes, never removes. A memory past its stated shelf life
-            # is usually still *true*, just no longer current -- so it keeps its
-            # content and just ranks lower, and the caller is told why.
-            exp_penalty = expiry.recall_penalty(d.get("expires_at"))
-            if exp_penalty:
-                total -= exp_penalty
-            rec = _clean(d)
-            rec["_score"] = round(total, 6)
-            if exp_penalty:
-                rec["_expired"] = True
-                rec["_expiry_penalty"] = exp_penalty
-            if explain:
-                # 6dp, not 4dp: `_score` is rounded to 6dp, so explain has to be
-                # at least as precise for a caller to recompute it. At 4dp the
-                # rounding error was ~2e-5 once a single component carried a
-                # large weight (keyword 0.61), which made `_explain` unable to
-                # reproduce `_score` -- i.e. the ranking stopped being auditable.
-                rec["_explain"] = {k: round(v, 6) for k, v in parts.items()}
-                rec["_weights"] = dict(weights, feedback=RECALL_FEEDBACK_WEIGHT)
-                rec["_profile"] = profile["profile"]
-                rec["_profile_reasons"] = profile["reasons"]
-                rec["_frequency_source"] = (
-                    "usage_feedback" if freq > 0 else "none"
-                )
-                rec["_access_count_observed"] = int(d.get("access_count") or 0)
-                rec["_type_multiplier"] = mtype_mult
-                rec["_semantic_available"] = sm is not None
-                # S6-FIX-06：概念桥只读诊断。整批一份，每条结果回显同一份，
-                # 与 `_weights` / `_profile` 的处理方式一致（它们也是每次查询
-                # 一份）。不含任何查询原文，只说「命中了几条、是哪几条」。
-                if lex_diag:
-                    rec["_bridge"] = dict(lex_diag)
-                rec["_activation"] = {
-                    "amount": round(act, 4),
-                    "contributions": spread.get(d["id"], {}).get("contributions", []),
-                }
-                if fb_info is not None:
-                    rec["_feedback"] = {
-                        "signal": fb_info["signal"],
-                        "applied": fb_info["applied"],
-                        "counts": fb_rows[d["id"]],
-                        "reason": fb_info["reason"],
-                    }
-            scored.append(rec)
-        # Stable sort: highest score first, then recency, then id.
-        scored.sort(key=lambda x: (x["_score"], x.get("updated_at") or "", x["id"]),
-                    reverse=True)
-        result = scored[:top_k]
-        # Optional relevance floor. DELIBERATELY OPT-IN (default None = off).
-        #
-        # S5-E measured whether a fixed score threshold can tell related from
-        # unrelated queries on the 45-query set: it cannot. Related top1 scores
-        # span 0.3707..0.7765 and unrelated top1 span 0.3583..0.4813 -- a real
-        # preference query ("我是什么样的人设") scores 0.3707, BELOW three of the
-        # four unrelated queries. Every threshold that suppressed the unrelated
-        # ones also rejected 6..10 legitimate queries; the best joint rule still
-        # rejected 1/41 related while keeping only 2/4 unrelated. Shipping any of
-        # them as a default would silently drop good memories, so we ship the
-        # mechanism and leave it disarmed rather than pick a number that looks
-        # good on 4 negative samples.
-        #
-        # When a caller does arm it, the rejection is *explicit*: an empty list
-        # plus a `_rejected` audit block, never a silently short list.
-        if min_score is not None and result:
-            kept = [r for r in result if r["_score"] >= min_score]
-            if not kept:
-                top = result[0]
-                rejected = {
-                    "reason": "below_min_score",
-                    "min_score": min_score,
-                    "best_score": top["_score"],
-                    "best_id": top["id"],
-                    "considered": len(result),
-                    "message": (
-                        "没有足够相关的记忆：最佳候选分数 %.4f 低于门槛 %.4f。"
-                        % (top["_score"], min_score)
-                    ),
-                }
-                if explain:
-                    rejected["best_explain"] = {
-                        k: v for k, v in top.items() if k.startswith("_")
-                    }
-                return [{"_rejected": rejected}] if explain else []
-            result = kept
+        rows, sem, lex, lex_diag, spread, fb_rows = _recall_candidates(
+            c, query, category, memory_type, explain)
+        scored = [
+            _recall_score_one(
+                dict(row), weights=weights, shape=shape,
+                profile_name=profile["profile"],
+                profile_reasons=profile["reasons"],
+                lex=lex, sem=sem, spread=spread, fb_rows=fb_rows,
+                explain=explain, lex_diag=lex_diag,
+            )
+            for row in rows
+        ]
+        result, terminal = _recall_rank(scored, top_k, min_score, explain)
+        if terminal:
+            return result
         if include_related:
-            ids = [r["id"] for r in result]
-            related = _related_subgraph(c, ids, max_depth=1)
-            for r in result:
-                r["_related"] = related.get(r["id"], [])
-        # 记一次真实访问。只加 access_count / last_accessed_at（频次分量的
-        # 原料），不改 confidence、不写反馈信号、不 rescore —— "曝光不能让
-        # 记忆升格"这条规矩不受影响。
-        #
-        # 放在拿到 result 之后：记的是"真正返回给调用方的那些"，而不是
-        # "参与打分的全部候选"。
-        # `record_access=False` 是给评测用的：access_count 会反过来
-        # 喂 frequency 分量，同一套题跑两遍第二遍就是在用上一遍刷
-        # 出来的数字打分（实测 @1 6/8 → 4/8，差别只在跑过什么）。
-        if result and record_access:
-            try:
-                from app import governance_service as _gov
-                _gov.touch_access([r["id"] for r in result])
-            except Exception:  # noqa: BLE001 —— 记账失败不该让召回本身失败
-                pass
+            _recall_attach_related(c, result)
+        _recall_touch(result, record_access)
         return result
 
     if conn is not None:
@@ -806,8 +849,12 @@ def get_memory_details(memory_id: int) -> dict:
         gov_status = gov.get_governance_status(memory_id)
         fb = conn.execute("SELECT * FROM memory_feedback WHERE memory_id=?", (memory_id,)).fetchone()
         rel = list_memory_relations(memory_id)
-        from app import mcp_server as _mcp  # local import to avoid cycle at module load
-        base = _mcp._memory_out(d)
+        # OPT-02-B1: 原为 `from app import mcp_server as _mcp` +
+        # `_mcp._memory_out(d)`，那是业务层反向依赖入口层（MCP 工具注册模块），
+        # 只为借用同一个「剥掉治理列 + 解析 tags」的行整形函数。本例改用本模块
+        # 已有的 `_clean()`：两者的治理列集合逐字段相同（8 个），tags 解析与
+        # 异常兜底行为也相同（已用 11 项对拍验证，含非法 JSON / NULL / 空数组）。
+        base = _clean(d)
         detail = {
             "ok": True,
             "memory": base,
